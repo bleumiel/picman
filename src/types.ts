@@ -68,3 +68,11 @@ export interface ThumbnailProps {
   badge?: string;
   className?: string;
 }
+
+export type ResultSortKey =
+  | "reclaimable-desc"
+  | "files-desc"
+  | "keep-path-asc"
+  | "keep-path-desc"
+  | "modified-desc"
+  | "modified-asc";

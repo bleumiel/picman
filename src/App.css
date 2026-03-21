@@ -127,6 +127,7 @@ body {
 }
 
 input,
+select,
 button {
   border-radius: 14px;
   border: 1px solid rgba(157, 184, 255, 0.18);
@@ -142,6 +143,12 @@ input {
   flex: 1;
   min-width: 0;
   padding: 14px 16px;
+  color: #eef3ff;
+  background: rgba(8, 14, 28, 0.9);
+}
+
+select {
+  padding: 12px 14px;
   color: #eef3ff;
   background: rgba(8, 14, 28, 0.9);
 }
@@ -348,6 +355,19 @@ code {
   gap: 16px;
   align-items: center;
   margin-bottom: 18px;
+}
+
+.sort-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sort-controls label {
+  color: #b9c6e0;
+  font-size: 0.92rem;
+  font-weight: 600;
 }
 
 .group-list {

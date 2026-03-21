@@ -3,13 +3,20 @@ import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
-import type { QuarantineResult, ScanProgress, ScanReport, ThumbnailProps } from "./types";
+import type {
+  QuarantineResult,
+  ResultSortKey,
+  ScanProgress,
+  ScanReport,
+  ThumbnailProps,
+} from "./types";
 
 const SCAN_PROGRESS_EVENT = "scan-progress";
 
 function App() {
   const [rootDraft, setRootDraft] = useState("");
   const [rootPaths, setRootPaths] = useState<string[]>([]);
+  const [sortKey, setSortKey] = useState<ResultSortKey>("reclaimable-desc");
   const [report, setReport] = useState<ScanReport | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +37,10 @@ function App() {
   );
 
   const liveGroups = scanProgress?.previewGroups ?? [];
-  const displayedGroups = report?.groups ?? liveGroups;
+  const displayedGroups = useMemo(
+    () => sortGroups(report?.groups ?? liveGroups, sortKey),
+    [liveGroups, report?.groups, sortKey],
+  );
 
   useEffect(() => {
     let isMounted = true;
@@ -417,6 +427,23 @@ function App() {
                     : `${report.groups.length} groupe(s) prets a etre verifies.`}
                 </p>
               </div>
+              {report.groups.length > 0 ? (
+                <div className="sort-controls">
+                  <label htmlFor="result-sort">Trier par</label>
+                  <select
+                    id="result-sort"
+                    value={sortKey}
+                    onChange={(event) => setSortKey(event.currentTarget.value as ResultSortKey)}
+                  >
+                    <option value="reclaimable-desc">Espace recuperable (desc)</option>
+                    <option value="files-desc">Nombre de fichiers (desc)</option>
+                    <option value="modified-desc">Date de la meilleure photo (recent)</option>
+                    <option value="modified-asc">Date de la meilleure photo (ancien)</option>
+                    <option value="keep-path-asc">Chemin du fichier garde (A-Z)</option>
+                    <option value="keep-path-desc">Chemin du fichier garde (Z-A)</option>
+                  </select>
+                </div>
+              ) : null}
             </div>
 
             {report.groups.length === 0 ? (
@@ -428,7 +455,7 @@ function App() {
               </div>
             ) : (
               <DuplicateGroupList
-                groups={report.groups}
+                groups={displayedGroups}
                 isQuarantining={isQuarantining}
                 onQuarantineGroup={quarantinePaths}
               />
@@ -456,6 +483,23 @@ function App() {
                   : `${displayedGroups.length} groupe(s) deja identifies pendant l'analyse.`}
               </p>
             </div>
+            {displayedGroups.length > 0 ? (
+              <div className="sort-controls">
+                <label htmlFor="live-result-sort">Trier par</label>
+                <select
+                  id="live-result-sort"
+                  value={sortKey}
+                  onChange={(event) => setSortKey(event.currentTarget.value as ResultSortKey)}
+                >
+                  <option value="reclaimable-desc">Espace recuperable (desc)</option>
+                  <option value="files-desc">Nombre de fichiers (desc)</option>
+                  <option value="modified-desc">Date de la meilleure photo (recent)</option>
+                  <option value="modified-asc">Date de la meilleure photo (ancien)</option>
+                  <option value="keep-path-asc">Chemin du fichier garde (A-Z)</option>
+                  <option value="keep-path-desc">Chemin du fichier garde (Z-A)</option>
+                </select>
+              </div>
+            ) : null}
           </div>
 
           {displayedGroups.length === 0 ? (
@@ -772,6 +816,49 @@ function formatPathList(paths: string[]) {
   }
 
   return `${paths[0]} et ${paths.length - 1} autre(s) dossier(s)`;
+}
+
+function sortGroups(groups: ScanReport["groups"], sortKey: ResultSortKey) {
+  const sorted = [...groups];
+
+  sorted.sort((left, right) => {
+    switch (sortKey) {
+      case "files-desc":
+        return (
+          right.fileCount - left.fileCount ||
+          right.reclaimableBytes - left.reclaimableBytes ||
+          left.keepRelativePath.localeCompare(right.keepRelativePath)
+        );
+      case "keep-path-asc":
+        return left.keepRelativePath.localeCompare(right.keepRelativePath);
+      case "keep-path-desc":
+        return right.keepRelativePath.localeCompare(left.keepRelativePath);
+      case "modified-desc":
+        return (
+          getKeepModifiedTimestamp(right) - getKeepModifiedTimestamp(left) ||
+          right.reclaimableBytes - left.reclaimableBytes
+        );
+      case "modified-asc":
+        return (
+          getKeepModifiedTimestamp(left) - getKeepModifiedTimestamp(right) ||
+          right.reclaimableBytes - left.reclaimableBytes
+        );
+      case "reclaimable-desc":
+      default:
+        return (
+          right.reclaimableBytes - left.reclaimableBytes ||
+          right.fileCount - left.fileCount ||
+          left.keepRelativePath.localeCompare(right.keepRelativePath)
+        );
+    }
+  });
+
+  return sorted;
+}
+
+function getKeepModifiedTimestamp(group: ScanReport["groups"][number]) {
+  const keepFile = group.files.find((file) => file.path === group.keepPath);
+  return keepFile?.modifiedUnixMs ?? 0;
 }
 
 export default App;

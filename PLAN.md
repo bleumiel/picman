@@ -21,7 +21,7 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 - L'UI propose maintenant un picker de dossier natif et des miniatures pour faciliter la revue des groupes
 - Les groupes de doublons commencent a apparaitre pendant l'analyse et le scan evite maintenant de hasher les fichiers dont la taille est unique
 - Le hash des candidats est maintenant parallélisé de façon modérée et une analyse en cours peut être annulée depuis l'interface
-- Une meme analyse peut maintenant couvrir plusieurs dossiers a la fois, avec quarantaine dediee par racine et annulation plus reactive grace a des previews live limitees
+- Une meme analyse peut maintenant couvrir plusieurs dossiers a la fois, avec quarantaine dediee par racine, annulation plus reactive grace a des previews live limitees et tri des groupes detectes dans l'interface
 
 ## Phasage recommande
 
@@ -78,4 +78,4 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
    - Tests Rust unitaires ajoutes; journalisation detaillee a renforcer dans une iteration suivante.
 
 11. `polir-experience-de-scan`
-   - Progression de scan visible, picker multi-dossiers, miniatures de groupe, pre-affichage des doublons pendant le scan, filtrage par taille, hash parallele modere, annulation reactive et quarantaine par racine en place; prochaine amelioration naturelle: progression de quarantaine, selection fine et parallelisation configurable.
+   - Progression de scan visible, picker multi-dossiers, miniatures de groupe, pre-affichage des doublons pendant le scan, filtrage par taille, hash parallele modere, annulation reactive, quarantaine par racine et tri des groupes en place; prochaine amelioration naturelle: copies reduites/recompressees, progression de quarantaine, selection fine et parallelisation configurable.
