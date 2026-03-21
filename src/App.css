@@ -178,6 +178,38 @@ button:disabled {
   background: rgba(24, 37, 67, 0.92);
 }
 
+.cancel-button {
+  color: #ffe7e1;
+  background: rgba(96, 37, 29, 0.95);
+}
+
+.selected-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.root-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  color: #dce8ff;
+  background: rgba(21, 34, 62, 0.96);
+}
+
+.root-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.root-chip strong {
+  font-size: 1rem;
+  line-height: 1;
+}
+
 .helper-text,
 .warning-panel li,
 .file-main p,
@@ -559,6 +591,11 @@ code {
 
   .scan-row {
     flex-direction: column;
+  }
+
+  .root-chip {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .danger-button {

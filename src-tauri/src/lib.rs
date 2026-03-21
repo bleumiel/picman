@@ -1,20 +1,38 @@
 use image::image_dimensions;
+use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::{DirEntry, WalkDir};
 
 const QUARANTINE_DIR_NAME: &str = ".picman-quarantine";
 const SUPPORTED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "heic"];
 const MAX_WARNINGS: usize = 25;
+const MAX_PREVIEW_GROUPS: usize = 12;
 const SCAN_PROGRESS_EVENT: &str = "scan-progress";
 const COUNT_PROGRESS_EMIT_INTERVAL: usize = 250;
-const HASH_PROGRESS_EMIT_INTERVAL: usize = 10;
+const HASH_PROGRESS_EMIT_INTERVAL: usize = 25;
+const SCAN_CANCELLED_MESSAGE: &str = "Analyse annulee.";
+
+#[derive(Default)]
+struct ScanControl {
+    current_scan_cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ScanRoot {
+    canonical_path: PathBuf,
+    display_name: String,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,8 +76,8 @@ struct ScanSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanReport {
-    root_path: String,
-    quarantine_root: String,
+    root_paths: Vec<String>,
+    quarantine_roots: Vec<String>,
     summary: ScanSummary,
     groups: Vec<DuplicateGroup>,
     warnings: Vec<String>,
@@ -89,7 +107,7 @@ struct QuarantineFailure {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuarantineResult {
-    quarantine_path: String,
+    quarantine_paths: Vec<String>,
     moved_count: usize,
     failed: Vec<QuarantineFailure>,
 }
@@ -97,6 +115,8 @@ struct QuarantineResult {
 #[derive(Clone, Debug)]
 struct ScanCandidate {
     path: PathBuf,
+    root_index: usize,
+    display_path: String,
 }
 
 #[derive(Debug)]
@@ -109,30 +129,59 @@ struct ScanInventory {
 }
 
 #[tauri::command]
-async fn scan_photo_library(app: AppHandle, root_path: String) -> Result<ScanReport, String> {
+async fn scan_photo_library(app: AppHandle, root_paths: Vec<String>) -> Result<ScanReport, String> {
+    let cancel_flag = register_scan_cancel_flag(&app)?;
     let app_handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || scan_photo_library_impl(&app_handle, &root_path))
-        .await
-        .map_err(|error| format!("La tache d'analyse a echoue: {error}"))?
+    let cancel_flag_clone = cancel_flag.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        scan_photo_library_impl(&app_handle, root_paths, &cancel_flag_clone)
+    })
+    .await
+    .map_err(|error| format!("La tache d'analyse a echoue: {error}"))?;
+
+    clear_scan_cancel_flag(&app, &cancel_flag);
+    result
+}
+
+#[tauri::command]
+fn cancel_scan(state: State<'_, ScanControl>) -> Result<bool, String> {
+    let guard = state
+        .current_scan_cancel
+        .lock()
+        .map_err(|_| "Le controle d'annulation du scan est indisponible.".to_string())?;
+
+    if let Some(flag) = guard.as_ref() {
+        flag.store(true, Ordering::SeqCst);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[tauri::command]
 async fn quarantine_duplicates(
-    root_path: String,
+    root_paths: Vec<String>,
     paths: Vec<String>,
 ) -> Result<QuarantineResult, String> {
-    tauri::async_runtime::spawn_blocking(move || quarantine_duplicates_impl(&root_path, paths))
+    tauri::async_runtime::spawn_blocking(move || quarantine_duplicates_impl(root_paths, paths))
         .await
         .map_err(|error| format!("La mise en quarantaine a echoue: {error}"))?
 }
 
-fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanReport, String> {
-    let root = canonicalize_existing_directory(root_path)?;
+fn scan_photo_library_impl(
+    app: &AppHandle,
+    root_paths: Vec<String>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<ScanReport, String> {
+    let roots = canonicalize_existing_roots(root_paths)?;
+    let use_root_prefix = roots.len() > 1;
+
     emit_scan_progress(
         app,
         ScanProgressPayload::new(
             "counting",
-            "Preparation de l'analyse du dossier...",
+            "Preparation de l'analyse des dossiers...",
             0,
             None,
             None,
@@ -144,7 +193,8 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
     );
 
     let mut warnings = Vec::new();
-    let inventory = collect_supported_photo_paths(&root, app, &mut warnings)?;
+    let inventory =
+        collect_supported_photo_paths(&roots, use_root_prefix, app, cancel_flag, &mut warnings)?;
     let ScanInventory {
         hash_candidates,
         total_files_seen,
@@ -153,13 +203,37 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
         hash_candidate_files,
     } = inventory;
 
+    if hash_candidate_files == 0 {
+        return Ok(ScanReport {
+            root_paths: roots
+                .iter()
+                .map(|root| path_to_string(&root.canonical_path))
+                .collect(),
+            quarantine_roots: roots
+                .iter()
+                .map(|root| path_to_string(&root.canonical_path.join(QUARANTINE_DIR_NAME)))
+                .collect(),
+            summary: ScanSummary {
+                total_files_seen,
+                supported_files,
+                duplicate_groups: 0,
+                duplicates_to_remove: 0,
+                reclaimable_bytes: 0,
+                skipped_files,
+            },
+            groups: Vec::new(),
+            warnings,
+        });
+    }
+
+    let hash_parallelism = recommended_hash_parallelism();
     emit_scan_progress(
         app,
         ScanProgressPayload::new(
             "hashing",
             format!(
-                "{} photo(s) prises en charge, {} candidate(s) a hasher apres filtrage par taille.",
-                supported_files, hash_candidate_files
+                "{} photo(s) prises en charge, {} candidate(s) a hasher sur {} thread(s).",
+                supported_files, hash_candidate_files, hash_parallelism
             ),
             0,
             Some(hash_candidate_files),
@@ -171,34 +245,97 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
         ),
     );
 
-    let mut skipped_files = skipped_files;
-    let mut files_by_hash: HashMap<String, Vec<PhotoRecord>> = HashMap::new();
+    let files_by_hash = Arc::new(Mutex::new(HashMap::<String, Vec<PhotoRecord>>::new()));
+    let warning_buffer = Arc::new(Mutex::new(warnings));
+    let skipped_counter = Arc::new(AtomicUsize::new(skipped_files));
+    let processed_counter = Arc::new(AtomicUsize::new(0));
+    let last_emitted = Arc::new(AtomicUsize::new(0));
 
-    for (index, candidate) in hash_candidates.iter().enumerate() {
-        let current_path = Some(relative_path_from_root(&root, &candidate.path));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(hash_parallelism)
+        .build()
+        .map_err(|error| format!("Impossible d'initialiser le pool de hash: {error}"))?;
 
-        match build_photo_record(&root, &candidate.path) {
-            Ok((hash, record)) => files_by_hash.entry(hash).or_default().push(record),
-            Err(error) => {
-                skipped_files += 1;
-                push_warning(
-                    &mut warnings,
-                    format!("{}: {}", candidate.path.to_string_lossy(), error),
+    let hashing_result = pool.install(|| {
+        hash_candidates.par_iter().try_for_each(|candidate| -> Result<(), String> {
+            if is_scan_cancelled(cancel_flag) {
+                return Err(SCAN_CANCELLED_MESSAGE.to_string());
+            }
+
+            let root = &roots[candidate.root_index];
+
+            match build_photo_record(root, &candidate.path, use_root_prefix) {
+                Ok((hash, record)) => {
+                    let mut guard = files_by_hash.lock().map_err(|_| {
+                        "Le regroupement des hash est devenu indisponible.".to_string()
+                    })?;
+                    guard.entry(hash).or_default().push(record);
+                }
+                Err(error) => {
+                    skipped_counter.fetch_add(1, Ordering::SeqCst);
+                    let mut warning_guard = warning_buffer.lock().map_err(|_| {
+                        "Le buffer de warnings est devenu indisponible.".to_string()
+                    })?;
+                    push_warning(
+                        &mut warning_guard,
+                        format!("{}: {}", candidate.path.to_string_lossy(), error),
+                    );
+                }
+            }
+
+            let processed_items = processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+            if should_emit_hash_progress(processed_items, hash_candidate_files)
+                && last_emitted.swap(processed_items, Ordering::SeqCst) < processed_items
+            {
+                let preview_groups = {
+                    let guard = files_by_hash.lock().map_err(|_| {
+                        "Le regroupement des hash est devenu indisponible.".to_string()
+                    })?;
+                    build_duplicate_groups(&guard, Some(MAX_PREVIEW_GROUPS))
+                };
+
+                emit_scan_progress(
+                    app,
+                    ScanProgressPayload::new(
+                        "hashing",
+                        format!("Analyse des signatures {processed_items}/{hash_candidate_files}..."),
+                        processed_items,
+                        Some(hash_candidate_files),
+                        Some(candidate.display_path.clone()),
+                        total_files_seen,
+                        supported_files,
+                        hash_candidate_files,
+                        preview_groups,
+                    ),
                 );
             }
-        }
 
-        let processed_items = index + 1;
-        if should_emit_hash_progress(processed_items, hash_candidate_files) {
-            let preview_groups = build_duplicate_groups(&files_by_hash);
+            if is_scan_cancelled(cancel_flag) {
+                return Err(SCAN_CANCELLED_MESSAGE.to_string());
+            }
+
+            Ok(())
+        })
+    });
+
+    if let Err(error) = hashing_result {
+        if error == SCAN_CANCELLED_MESSAGE {
+            let preview_groups = {
+                let guard = files_by_hash
+                    .lock()
+                    .map_err(|_| "Le regroupement des hash est devenu indisponible.".to_string())?;
+                build_duplicate_groups(&guard, Some(MAX_PREVIEW_GROUPS))
+            };
+
             emit_scan_progress(
                 app,
                 ScanProgressPayload::new(
-                    "hashing",
-                    format!("Analyse des signatures {processed_items}/{hash_candidate_files}..."),
-                    processed_items,
+                    "cancelled",
+                    "Analyse annulee par l'utilisateur.",
+                    processed_counter.load(Ordering::SeqCst),
                     Some(hash_candidate_files),
-                    current_path,
+                    None,
                     total_files_seen,
                     supported_files,
                     hash_candidate_files,
@@ -206,27 +343,26 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
                 ),
             );
         }
+
+        return Err(error);
     }
 
-    let groups = build_duplicate_groups(&files_by_hash);
+    let warnings = Arc::try_unwrap(warning_buffer)
+        .map_err(|_| "Impossible de finaliser les warnings du scan.".to_string())?
+        .into_inner()
+        .map_err(|_| "Le buffer de warnings est devenu indisponible.".to_string())?;
+
+    let groups = {
+        let guard = files_by_hash
+            .lock()
+            .map_err(|_| "Le regroupement des hash est devenu indisponible.".to_string())?;
+        build_duplicate_groups(&guard, None)
+    };
+
     let duplicate_groups = groups.len();
     let duplicates_to_remove = groups.iter().map(|group| group.file_count - 1).sum();
     let reclaimable_bytes = groups.iter().map(|group| group.reclaimable_bytes).sum();
-
-    emit_scan_progress(
-        app,
-        ScanProgressPayload::new(
-            "grouping",
-            "Regroupement des doublons exacts...",
-            hash_candidate_files,
-            Some(hash_candidate_files),
-            None,
-            total_files_seen,
-            supported_files,
-            hash_candidate_files,
-            groups.clone(),
-        ),
-    );
+    let skipped_files = skipped_counter.load(Ordering::SeqCst);
 
     emit_scan_progress(
         app,
@@ -239,13 +375,19 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
             total_files_seen,
             supported_files,
             hash_candidate_files,
-            groups.clone(),
+            build_duplicate_groups_preview(&groups),
         ),
     );
 
     Ok(ScanReport {
-        root_path: path_to_string(&root),
-        quarantine_root: path_to_string(&root.join(QUARANTINE_DIR_NAME)),
+        root_paths: roots
+            .iter()
+            .map(|root| path_to_string(&root.canonical_path))
+            .collect(),
+        quarantine_roots: roots
+            .iter()
+            .map(|root| path_to_string(&root.canonical_path.join(QUARANTINE_DIR_NAME)))
+            .collect(),
         summary: ScanSummary {
             total_files_seen,
             supported_files,
@@ -260,111 +402,153 @@ fn scan_photo_library_impl(app: &AppHandle, root_path: &str) -> Result<ScanRepor
 }
 
 fn quarantine_duplicates_impl(
-    root_path: &str,
+    root_paths: Vec<String>,
     paths: Vec<String>,
 ) -> Result<QuarantineResult, String> {
     if paths.is_empty() {
         return Err("Aucun doublon selectionne pour la quarantaine.".into());
     }
 
-    let root = canonicalize_existing_directory(root_path)?;
-    let quarantine_root = root.join(QUARANTINE_DIR_NAME);
-    let batch_directory = quarantine_root.join(format!("batch-{}", unix_timestamp_seconds()));
-    fs::create_dir_all(&batch_directory)
-        .map_err(|error| format!("Impossible de creer la quarantaine: {error}"))?;
-
+    let roots = canonicalize_existing_roots(root_paths)?;
     let mut moved_count = 0usize;
     let mut failed = Vec::new();
+    let mut quarantine_directories: HashMap<usize, PathBuf> = HashMap::new();
 
     for path in paths {
-        if let Err(error) = move_file_to_quarantine(&root, &batch_directory, Path::new(&path)) {
-            failed.push(QuarantineFailure {
+        let source_path = PathBuf::from(&path);
+        match find_matching_root_index(&roots, &source_path) {
+            Ok(root_index) => {
+                let batch_directory = quarantine_directories
+                    .entry(root_index)
+                    .or_insert_with(|| {
+                        roots[root_index]
+                            .canonical_path
+                            .join(QUARANTINE_DIR_NAME)
+                            .join(format!("batch-{}", unix_timestamp_seconds()))
+                    })
+                    .clone();
+
+                if let Err(error) = create_quarantine_directory(&batch_directory).and_then(|_| {
+                    move_file_to_quarantine(
+                        &roots[root_index].canonical_path,
+                        &batch_directory,
+                        &source_path,
+                    )
+                }) {
+                    failed.push(QuarantineFailure {
+                        source_path: path,
+                        reason: error,
+                    });
+                } else {
+                    moved_count += 1;
+                }
+            }
+            Err(error) => failed.push(QuarantineFailure {
                 source_path: path,
                 reason: error,
-            });
-        } else {
-            moved_count += 1;
+            }),
         }
     }
 
+    let quarantine_paths = quarantine_directories
+        .into_values()
+        .map(|path| path_to_string(&path))
+        .collect();
+
     Ok(QuarantineResult {
-        quarantine_path: path_to_string(&batch_directory),
+        quarantine_paths,
         moved_count,
         failed,
     })
 }
 
 fn collect_supported_photo_paths(
-    root: &Path,
+    roots: &[ScanRoot],
+    use_root_prefix: bool,
     app: &AppHandle,
+    cancel_flag: &Arc<AtomicBool>,
     warnings: &mut Vec<String>,
 ) -> Result<ScanInventory, String> {
-    let mut size_groups: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    let mut size_groups: HashMap<u64, Vec<ScanCandidate>> = HashMap::new();
     let mut total_files_seen = 0usize;
     let mut supported_files = 0usize;
     let mut skipped_files = 0usize;
 
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|entry| should_visit_entry(entry))
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                skipped_files += 1;
-                push_warning(warnings, format!("Entree ignoree: {error}"));
-                continue;
+    for (root_index, root) in roots.iter().enumerate() {
+        for entry in WalkDir::new(&root.canonical_path)
+            .into_iter()
+            .filter_entry(|entry| should_visit_entry(entry))
+        {
+            if is_scan_cancelled(cancel_flag) {
+                return Err(SCAN_CANCELLED_MESSAGE.to_string());
             }
-        };
 
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        total_files_seen += 1;
-
-        if is_supported_image(entry.path()) {
-            match entry.metadata() {
-                Ok(metadata) => {
-                    supported_files += 1;
-                    size_groups
-                        .entry(metadata.len())
-                        .or_default()
-                        .push(entry.path().to_path_buf());
-                }
+            let entry = match entry {
+                Ok(entry) => entry,
                 Err(error) => {
                     skipped_files += 1;
-                    push_warning(
-                        warnings,
-                        format!(
-                            "{}: metadata indisponibles ({error})",
-                            entry.path().to_string_lossy()
-                        ),
-                    );
+                    push_warning(warnings, format!("Entree ignoree: {error}"));
+                    continue;
                 }
-            }
-        } else {
-            skipped_files += 1;
-        }
+            };
 
-        if should_emit_count_progress(total_files_seen) {
-            emit_scan_progress(
-                app,
-                ScanProgressPayload::new(
-                    "counting",
-                    format!(
-                        "{} entree(s) parcourue(s), {} photo(s) retenue(s).",
-                        total_files_seen, supported_files
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            total_files_seen += 1;
+
+            if is_supported_image(entry.path()) {
+                match entry.metadata() {
+                    Ok(metadata) => {
+                        supported_files += 1;
+                        size_groups
+                            .entry(metadata.len())
+                            .or_default()
+                            .push(ScanCandidate {
+                                path: entry.path().to_path_buf(),
+                                root_index,
+                                display_path: display_path_for_root(
+                                    root,
+                                    entry.path(),
+                                    use_root_prefix,
+                                ),
+                            });
+                    }
+                    Err(error) => {
+                        skipped_files += 1;
+                        push_warning(
+                            warnings,
+                            format!(
+                                "{}: metadata indisponibles ({error})",
+                                entry.path().to_string_lossy()
+                            ),
+                        );
+                    }
+                }
+            } else {
+                skipped_files += 1;
+            }
+
+            if should_emit_count_progress(total_files_seen) {
+                emit_scan_progress(
+                    app,
+                    ScanProgressPayload::new(
+                        "counting",
+                        format!(
+                            "{} entree(s) parcourue(s), {} photo(s) retenue(s).",
+                            total_files_seen, supported_files
+                        ),
+                        total_files_seen,
+                        None,
+                        Some(display_path_for_root(root, entry.path(), use_root_prefix)),
+                        total_files_seen,
+                        supported_files,
+                        0,
+                        Vec::new(),
                     ),
-                    total_files_seen,
-                    None,
-                    Some(relative_path_from_root(root, entry.path())),
-                    total_files_seen,
-                    supported_files,
-                    0,
-                    Vec::new(),
-                ),
-            );
+                );
+            }
         }
     }
 
@@ -398,23 +582,22 @@ fn collect_supported_photo_paths(
     })
 }
 
-fn build_hash_candidates(size_groups: HashMap<u64, Vec<PathBuf>>) -> Vec<ScanCandidate> {
+fn build_hash_candidates(size_groups: HashMap<u64, Vec<ScanCandidate>>) -> Vec<ScanCandidate> {
     let mut candidates = Vec::new();
 
     for (_, paths) in size_groups {
         if paths.len() > 1 {
-            for path in paths {
-                candidates.push(ScanCandidate { path });
-            }
+            candidates.extend(paths);
         }
     }
 
-    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     candidates
 }
 
 fn build_duplicate_groups(
     files_by_hash: &HashMap<String, Vec<PhotoRecord>>,
+    limit: Option<usize>,
 ) -> Vec<DuplicateGroup> {
     let mut groups: Vec<DuplicateGroup> = files_by_hash
         .iter()
@@ -451,26 +634,82 @@ fn build_duplicate_groups(
             .then_with(|| left.keep_relative_path.cmp(&right.keep_relative_path))
     });
 
+    if let Some(limit) = limit {
+        groups.truncate(limit);
+    }
+
     groups
+}
+
+fn build_duplicate_groups_preview(groups: &[DuplicateGroup]) -> Vec<DuplicateGroup> {
+    groups.iter().take(MAX_PREVIEW_GROUPS).cloned().collect()
 }
 
 fn should_visit_entry(entry: &DirEntry) -> bool {
     entry.depth() == 0 || entry.file_name() != QUARANTINE_DIR_NAME
 }
 
+fn canonicalize_existing_roots(root_paths: Vec<String>) -> Result<Vec<ScanRoot>, String> {
+    let mut roots = Vec::new();
+    let mut seen = HashMap::<String, ()>::new();
+
+    for root_path in root_paths {
+        let trimmed = root_path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let canonical_path = canonicalize_existing_directory(trimmed)?;
+        let key = canonical_path.to_string_lossy().to_ascii_lowercase();
+        if seen.contains_key(&key) {
+            continue;
+        }
+        seen.insert(key, ());
+
+        roots.push(ScanRoot {
+            display_name: canonical_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(trimmed)
+                .to_string(),
+            canonical_path,
+        });
+    }
+
+    if roots.is_empty() {
+        return Err("Ajoute au moins un dossier photo a analyser.".into());
+    }
+
+    Ok(roots)
+}
+
 fn canonicalize_existing_directory(path: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(path);
     if !candidate.exists() {
-        return Err("Le dossier a analyser n'existe pas.".into());
+        return Err(format!("Le dossier `{path}` n'existe pas."));
     }
 
     if !candidate.is_dir() {
-        return Err("Le chemin fourni doit pointer vers un dossier.".into());
+        return Err(format!("Le chemin `{path}` doit pointer vers un dossier."));
     }
 
     candidate
         .canonicalize()
-        .map_err(|error| format!("Impossible de resoudre le dossier: {error}"))
+        .map_err(|error| format!("Impossible de resoudre le dossier `{path}`: {error}"))
+}
+
+fn find_matching_root_index(roots: &[ScanRoot], source_path: &Path) -> Result<usize, String> {
+    let canonical_source = source_path
+        .canonicalize()
+        .map_err(|error| format!("chemin source invalide ({error})"))?;
+
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| canonical_source.starts_with(&root.canonical_path))
+        .max_by_key(|(_, root)| root.canonical_path.components().count())
+        .map(|(index, _)| index)
+        .ok_or_else(|| "Le fichier n'appartient a aucun des dossiers scannes.".to_string())
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -481,7 +720,11 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_photo_record(root: &Path, path: &Path) -> Result<(String, PhotoRecord), String> {
+fn build_photo_record(
+    root: &ScanRoot,
+    path: &Path,
+    use_root_prefix: bool,
+) -> Result<(String, PhotoRecord), String> {
     let canonical_path = path
         .canonicalize()
         .map_err(|error| format!("chemin non resolu ({error})"))?;
@@ -497,7 +740,7 @@ fn build_photo_record(root: &Path, path: &Path) -> Result<(String, PhotoRecord),
     let size_bytes = metadata.len();
     let quality_score = compute_quality_score(&extension, dimensions, size_bytes);
     let quality_reason = build_quality_reason(&extension, dimensions, size_bytes);
-    let relative_path = relative_path_from_root(root, &canonical_path);
+    let relative_path = display_path_for_root(root, &canonical_path, use_root_prefix);
     let hash = compute_sha256(&canonical_path)?;
 
     Ok((
@@ -536,7 +779,7 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
     let file = File::open(path).map_err(|error| format!("ouverture impossible ({error})"))?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8 * 1024];
+    let mut buffer = [0u8; 128 * 1024];
 
     loop {
         let bytes_read = reader
@@ -625,6 +868,11 @@ fn path_depth(path: &str) -> usize {
     Path::new(path).components().count()
 }
 
+fn create_quarantine_directory(batch_directory: &Path) -> Result<(), String> {
+    fs::create_dir_all(batch_directory)
+        .map_err(|error| format!("Impossible de creer la quarantaine: {error}"))
+}
+
 fn move_file_to_quarantine(
     root: &Path,
     batch_directory: &Path,
@@ -708,19 +956,55 @@ fn should_emit_count_progress(total_files_seen: usize) -> bool {
 }
 
 fn should_emit_hash_progress(processed_items: usize, total_items: usize) -> bool {
-    total_items == 0
-        || processed_items == 1
+    processed_items == 1
         || processed_items == total_items
         || processed_items % HASH_PROGRESS_EMIT_INTERVAL == 0
 }
 
-fn relative_path_from_root(root: &Path, path: &Path) -> String {
-    path_to_string(path.strip_prefix(root).unwrap_or(path))
+fn display_path_for_root(root: &ScanRoot, path: &Path, use_root_prefix: bool) -> String {
+    let relative = path_to_string(path.strip_prefix(&root.canonical_path).unwrap_or(path));
+    if use_root_prefix {
+        format!("{}\\{}", root.display_name, relative)
+    } else {
+        relative
+    }
 }
 
 fn emit_scan_progress(app: &AppHandle, progress: ScanProgressPayload) {
     if let Err(error) = app.emit(SCAN_PROGRESS_EVENT, progress) {
         eprintln!("PicMan scan progress emit failed: {error}");
+    }
+}
+
+fn recommended_hash_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+        .clamp(1, 4)
+}
+
+fn is_scan_cancelled(cancel_flag: &Arc<AtomicBool>) -> bool {
+    cancel_flag.load(Ordering::SeqCst)
+}
+
+fn register_scan_cancel_flag(app: &AppHandle) -> Result<Arc<AtomicBool>, String> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let state = app.state::<ScanControl>();
+    let mut guard = state
+        .current_scan_cancel
+        .lock()
+        .map_err(|_| "Le controle d'annulation du scan est indisponible.".to_string())?;
+    *guard = Some(cancel_flag.clone());
+    Ok(cancel_flag)
+}
+
+fn clear_scan_cancel_flag(app: &AppHandle, cancel_flag: &Arc<AtomicBool>) {
+    if let Ok(mut guard) = app.state::<ScanControl>().current_scan_cancel.lock() {
+        if let Some(current_flag) = guard.as_ref() {
+            if Arc::ptr_eq(current_flag, cancel_flag) {
+                *guard = None;
+            }
+        }
     }
 }
 
@@ -757,10 +1041,12 @@ impl ScanProgressPayload {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ScanControl::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             scan_photo_library,
+            cancel_scan,
             quarantine_duplicates
         ])
         .run(tauri::generate_context!())
@@ -832,8 +1118,29 @@ mod tests {
     #[test]
     fn build_hash_candidates_only_keeps_size_collisions() {
         let mut size_groups = HashMap::new();
-        size_groups.insert(100, vec![PathBuf::from("a.jpg")]);
-        size_groups.insert(200, vec![PathBuf::from("b.jpg"), PathBuf::from("c.jpg")]);
+        size_groups.insert(
+            100,
+            vec![ScanCandidate {
+                path: PathBuf::from("a.jpg"),
+                root_index: 0,
+                display_path: "a.jpg".into(),
+            }],
+        );
+        size_groups.insert(
+            200,
+            vec![
+                ScanCandidate {
+                    path: PathBuf::from("b.jpg"),
+                    root_index: 0,
+                    display_path: "b.jpg".into(),
+                },
+                ScanCandidate {
+                    path: PathBuf::from("c.jpg"),
+                    root_index: 0,
+                    display_path: "c.jpg".into(),
+                },
+            ],
+        );
 
         let candidates = build_hash_candidates(size_groups);
         let paths: Vec<String> = candidates

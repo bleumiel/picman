@@ -8,12 +8,14 @@ import type { QuarantineResult, ScanProgress, ScanReport, ThumbnailProps } from 
 const SCAN_PROGRESS_EVENT = "scan-progress";
 
 function App() {
-  const [rootPath, setRootPath] = useState("");
+  const [rootDraft, setRootDraft] = useState("");
+  const [rootPaths, setRootPaths] = useState<string[]>([]);
   const [report, setReport] = useState<ScanReport | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [isQuarantining, setIsQuarantining] = useState(false);
   const [lastQuarantineResult, setLastQuarantineResult] = useState<QuarantineResult | null>(null);
 
@@ -36,8 +38,16 @@ function App() {
 
     const setupProgressListener = async () => {
       unlisten = await listen<ScanProgress>(SCAN_PROGRESS_EVENT, (event) => {
-        if (isMounted) {
-          setScanProgress(event.payload);
+        if (!isMounted) {
+          return;
+        }
+
+        setScanProgress(event.payload);
+
+        if (event.payload.phase === "cancelled") {
+          setIsScanning(false);
+          setIsCancelling(false);
+          setSuccess("Analyse annulee.");
         }
       });
     };
@@ -50,8 +60,15 @@ function App() {
     };
   }, []);
 
-  async function runScan(path: string) {
-    return invoke<ScanReport>("scan_photo_library", { rootPath: path });
+  async function runScan(paths: string[]) {
+    return invoke<ScanReport>("scan_photo_library", { rootPaths: paths });
+  }
+
+  async function refreshScan(paths: string[]) {
+    const nextReport = await runScan(paths);
+    setReport(nextReport);
+    setScanProgress(null);
+    return nextReport;
   }
 
   async function handlePickDirectory() {
@@ -60,54 +77,95 @@ function App() {
     try {
       const selected = await open({
         directory: true,
-        multiple: false,
-        title: "Choisir un dossier photo",
+        multiple: true,
+        title: "Choisir un ou plusieurs dossiers photo",
       });
 
       if (typeof selected === "string") {
-        setRootPath(selected);
+        mergeRootPaths([selected]);
+      } else if (Array.isArray(selected)) {
+        mergeRootPaths(selected.filter((value): value is string => typeof value === "string"));
       }
     } catch (pickerError) {
       setError(normalizeError(pickerError));
     }
   }
 
-  async function refreshScan(path: string) {
-    const nextReport = await runScan(path);
-    setReport(nextReport);
-    setScanProgress(null);
-    return nextReport;
+  function mergeRootPaths(paths: string[]) {
+    setRootPaths((current) => dedupePaths([...current, ...paths]));
+  }
+
+  function removeRootPath(path: string) {
+    setRootPaths((current) => current.filter((value) => value !== path));
+  }
+
+  function handleAddManualPath() {
+    const trimmed = rootDraft.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    mergeRootPaths(splitManualPaths(trimmed));
+    setRootDraft("");
+  }
+
+  async function handleCancelScan() {
+    if (!isScanning || isCancelling) {
+      return;
+    }
+
+    setError(null);
+    setSuccess("Annulation demandee...");
+    setIsCancelling(true);
+
+    void invoke<boolean>("cancel_scan").catch((cancelError) => {
+      setIsCancelling(false);
+      setError(normalizeError(cancelError));
+    });
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const trimmedPath = rootPath.trim();
+    const selectedRoots = dedupePaths([
+      ...rootPaths,
+      ...splitManualPaths(rootDraft.trim()),
+    ]);
+
     setError(null);
     setSuccess(null);
     setLastQuarantineResult(null);
+    setIsCancelling(false);
 
-    if (!trimmedPath) {
-      setError("Saisis un chemin absolu Windows vers un dossier photo.");
+    if (selectedRoots.length === 0) {
+      setError("Ajoute au moins un dossier photo a analyser.");
       return;
     }
 
+    setRootPaths(selectedRoots);
+    setRootDraft("");
     setIsScanning(true);
     setReport(null);
-    setScanProgress(createPendingProgress("Preparation de l'analyse du dossier..."));
+    setScanProgress(createPendingProgress("Preparation de l'analyse des dossiers..."));
+
     try {
-      await refreshScan(trimmedPath);
+      await refreshScan(selectedRoots);
     } catch (scanError) {
       setReport(null);
       setScanProgress(null);
-      setError(normalizeError(scanError));
+      const message = normalizeError(scanError);
+      if (message === "Analyse annulee.") {
+        setSuccess("Analyse annulee.");
+      } else {
+        setError(message);
+      }
     } finally {
       setIsScanning(false);
+      setIsCancelling(false);
     }
   }
 
   async function quarantinePaths(paths: string[]) {
-    const trimmedPath = rootPath.trim();
-    if (!trimmedPath || paths.length === 0) {
+    if (rootPaths.length === 0 || paths.length === 0) {
       return;
     }
 
@@ -116,22 +174,23 @@ function App() {
     setIsQuarantining(true);
     try {
       const result = await invoke<QuarantineResult>("quarantine_duplicates", {
-        rootPath: trimmedPath,
+        rootPaths,
         paths,
       });
 
       setLastQuarantineResult(result);
-      setScanProgress(createPendingProgress("Reanalyse du dossier apres quarantaine..."));
-      const refreshed = await refreshScan(trimmedPath);
+      setScanProgress(createPendingProgress("Reanalyse des dossiers apres quarantaine..."));
+      const refreshed = await refreshScan(rootPaths);
+      const quarantineTargets = formatPathList(result.quarantinePaths);
       setSuccess(
         result.failed.length === 0
-          ? `${result.movedCount} fichier(s) ont ete deplaces vers ${result.quarantinePath}.`
-          : `${result.movedCount} fichier(s) deplaces vers ${result.quarantinePath}. ${result.failed.length} echec(s) restent a verifier.`,
+          ? `${result.movedCount} fichier(s) ont ete deplaces vers ${quarantineTargets}.`
+          : `${result.movedCount} fichier(s) deplaces vers ${quarantineTargets}. ${result.failed.length} echec(s) restent a verifier.`,
       );
 
       if (refreshed.groups.length === 0 && result.movedCount > 0) {
         setSuccess(
-          `${result.movedCount} fichier(s) ont ete deplaces vers ${result.quarantinePath}. Aucun doublon exact restant.`,
+          `${result.movedCount} fichier(s) ont ete deplaces vers ${quarantineTargets}. Aucun doublon exact restant.`,
         );
       }
     } catch (quarantineError) {
@@ -152,29 +211,38 @@ function App() {
           <p className="eyebrow">PicMan MVP</p>
           <h1>Nettoyer ses dossiers photo sans supprimer a l&apos;aveugle.</h1>
           <p className="hero-copy">
-            Colle un dossier local, lance une analyse des formats JPEG, PNG et HEIC, puis mets
-            les doublons exacts en quarantaine en gardant une copie de reference.
+            Selectionne un ou plusieurs dossiers locaux, lance une analyse des formats JPEG, PNG
+            et HEIC, puis mets les doublons exacts en quarantaine en gardant une copie de
+            reference.
           </p>
         </div>
         <div className="hero-card">
           <span className="hero-card-label">Moteur actuel</span>
           <strong>Doublons exacts uniquement</strong>
-          <p>Detection par SHA-256, recommandation de conservation et quarantaine reversible.</p>
+          <p>Filtrage par taille, hash parallele modere, previsualisation live et annulation.</p>
         </div>
       </section>
 
       <form className="scan-panel" onSubmit={handleSubmit}>
         <label className="field-label" htmlFor="root-path">
-          Dossier a analyser
+          Dossiers a analyser
         </label>
         <div className="scan-row">
           <input
             id="root-path"
-            value={rootPath}
-            onChange={(event) => setRootPath(event.currentTarget.value)}
-            placeholder="C:\\Users\\bleum\\Pictures"
+            value={rootDraft}
+            onChange={(event) => setRootDraft(event.currentTarget.value)}
+            placeholder="C:\\Users\\bleum\\Pictures ou plusieurs chemins separes par ;"
             autoComplete="off"
           />
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={isScanning || isQuarantining}
+            onClick={handleAddManualPath}
+          >
+            Ajouter
+          </button>
           <button
             type="button"
             className="secondary-button"
@@ -183,13 +251,46 @@ function App() {
           >
             Parcourir...
           </button>
+          {isScanning ? (
+            <button
+              type="button"
+              className="cancel-button"
+              disabled={isCancelling}
+              onClick={handleCancelScan}
+            >
+              {isCancelling ? "Annulation..." : "Annuler"}
+            </button>
+          ) : null}
           <button type="submit" disabled={isScanning || isQuarantining}>
             {isScanning ? "Analyse en cours..." : "Analyser"}
           </button>
         </div>
+
+        <div className="selected-roots">
+          {rootPaths.length === 0 ? (
+            <p className="helper-text">
+              Ajoute des chemins manuellement ou utilise le picker pour choisir plusieurs dossiers
+              a la fois.
+            </p>
+          ) : (
+            rootPaths.map((path) => (
+              <button
+                key={path}
+                type="button"
+                className="root-chip"
+                disabled={isScanning || isQuarantining}
+                onClick={() => removeRootPath(path)}
+              >
+                <span>{path}</span>
+                <strong>&times;</strong>
+              </button>
+            ))
+          )}
+        </div>
+
         <p className="helper-text">
-          Exemple: <code>C:\Users\bleum\Pictures</code>. La quarantaine sera creee sous{" "}
-          <code>.picman-quarantine</code> dans le dossier scanne.
+          Les doublons peuvent etre detectes entre plusieurs dossiers. Les suppressions sont
+          envoyees vers une quarantaine propre a chaque racine analysee.
         </p>
       </form>
 
@@ -277,11 +378,11 @@ function App() {
               <h2>Action recommande</h2>
               <p>
                 PicMan conservera le meilleur candidat de chaque groupe et deplacera les autres
-                copies vers <code>{report.quarantineRoot}</code>.
+                copies vers {formatPathList(report.quarantineRoots)}.
               </p>
               {lastQuarantineResult ? (
                 <p className="helper-text">
-                  Derniere quarantaine: <code>{lastQuarantineResult.quarantinePath}</code>
+                  Derniere quarantaine: <code>{formatPathList(lastQuarantineResult.quarantinePaths)}</code>
                 </p>
               ) : null}
             </div>
@@ -312,7 +413,7 @@ function App() {
                 <h2>Groupes detectes</h2>
                 <p>
                   {report.groups.length === 0
-                    ? "Aucun doublon exact detecte dans ce dossier."
+                    ? "Aucun doublon exact detecte dans ces dossiers."
                     : `${report.groups.length} groupe(s) prets a etre verifies.`}
                 </p>
               </div>
@@ -338,8 +439,8 @@ function App() {
         <section className="empty-state pre-scan">
           <strong>En attente d&apos;un premier scan.</strong>
           <p>
-            PicMan commencera par parcourir recursivement le dossier, calculer les empreintes des
-            images prises en charge puis regrouper les doublons exacts.
+            PicMan commencera par parcourir les dossiers, calculer les empreintes des images prises
+            en charge puis regrouper les doublons exacts.
           </p>
         </section>
       ) : null}
@@ -359,7 +460,7 @@ function App() {
 
           {displayedGroups.length === 0 ? (
             <div className="empty-state">
-              <strong>PicMan continue l'analyse.</strong>
+              <strong>PicMan continue l&apos;analyse.</strong>
               <p>
                 Les groupes apparaitront ici au fur et a mesure que les fichiers en collision de
                 taille seront verifies par hash.
@@ -559,6 +660,8 @@ function getProgressTitle(phase: string) {
       return "Analyse des photos";
     case "grouping":
       return "Regroupement des doublons";
+    case "cancelled":
+      return "Annulation du scan";
     case "complete":
       return "Analyse terminee";
     default:
@@ -635,6 +738,40 @@ function normalizeError(error: unknown) {
 function getFileExtension(path: string) {
   const segments = path.split(".");
   return segments.length > 1 ? segments[segments.length - 1] ?? "" : "";
+}
+
+function splitManualPaths(value: string) {
+  return value
+    .split(/[;\n\r]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function dedupePaths(paths: string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const path of paths) {
+    const key = path.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(path);
+    }
+  }
+
+  return result;
+}
+
+function formatPathList(paths: string[]) {
+  if (paths.length === 0) {
+    return "la quarantaine";
+  }
+
+  if (paths.length === 1) {
+    return paths[0];
+  }
+
+  return `${paths[0]} et ${paths.length - 1} autre(s) dossier(s)`;
 }
 
 export default App;

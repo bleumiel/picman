@@ -32,8 +32,8 @@ export interface ScanSummary {
 }
 
 export interface ScanReport {
-  rootPath: string;
-  quarantineRoot: string;
+  rootPaths: string[];
+  quarantineRoots: string[];
   summary: ScanSummary;
   groups: DuplicateGroup[];
   warnings: string[];
@@ -57,7 +57,7 @@ export interface QuarantineFailure {
 }
 
 export interface QuarantineResult {
-  quarantinePath: string;
+  quarantinePaths: string[];
   movedCount: number;
   failed: QuarantineFailure[];
 }
