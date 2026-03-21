@@ -404,6 +404,13 @@ code {
   font-size: 1.15rem;
 }
 
+.group-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .group-stats {
   display: flex;
   flex-direction: column;
@@ -567,6 +574,16 @@ code {
 .keep-tag {
   color: #06233a;
   background: #8fd6ff;
+}
+
+.exact-tag {
+  color: #06233a;
+  background: #b7dcff;
+}
+
+.derived-tag {
+  color: #3b1800;
+  background: #ffd7aa;
 }
 
 .duplicate-tag {

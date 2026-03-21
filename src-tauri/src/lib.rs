@@ -1,8 +1,8 @@
-use image::image_dimensions;
+use image::{image_dimensions, imageops::FilterType, ImageReader};
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ const MAX_PREVIEW_GROUPS: usize = 12;
 const SCAN_PROGRESS_EVENT: &str = "scan-progress";
 const COUNT_PROGRESS_EMIT_INTERVAL: usize = 250;
 const HASH_PROGRESS_EMIT_INTERVAL: usize = 25;
+const SIMILARITY_PROGRESS_EMIT_INTERVAL: usize = 25;
 const SCAN_CANCELLED_MESSAGE: &str = "Analyse annulee.";
 
 #[derive(Default)]
@@ -53,6 +54,7 @@ struct PhotoRecord {
 #[serde(rename_all = "camelCase")]
 struct DuplicateGroup {
     hash: String,
+    group_kind: String,
     file_count: usize,
     total_size_bytes: u64,
     reclaimable_bytes: u64,
@@ -68,6 +70,8 @@ struct ScanSummary {
     total_files_seen: usize,
     supported_files: usize,
     duplicate_groups: usize,
+    exact_groups: usize,
+    reduced_groups: usize,
     duplicates_to_remove: usize,
     reclaimable_bytes: u64,
     skipped_files: usize,
@@ -121,11 +125,19 @@ struct ScanCandidate {
 
 #[derive(Debug)]
 struct ScanInventory {
+    supported_candidates: Vec<ScanCandidate>,
     hash_candidates: Vec<ScanCandidate>,
     total_files_seen: usize,
     supported_files: usize,
     skipped_files: usize,
     hash_candidate_files: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SimilarPhotoRecord {
+    signature: u64,
+    aspect_ratio_key: String,
+    record: PhotoRecord,
 }
 
 #[tauri::command]
@@ -196,6 +208,7 @@ fn scan_photo_library_impl(
     let inventory =
         collect_supported_photo_paths(&roots, use_root_prefix, app, cancel_flag, &mut warnings)?;
     let ScanInventory {
+        supported_candidates,
         hash_candidates,
         total_files_seen,
         supported_files,
@@ -217,6 +230,8 @@ fn scan_photo_library_impl(
                 total_files_seen,
                 supported_files,
                 duplicate_groups: 0,
+                exact_groups: 0,
+                reduced_groups: 0,
                 duplicates_to_remove: 0,
                 reclaimable_bytes: 0,
                 skipped_files,
@@ -264,7 +279,7 @@ fn scan_photo_library_impl(
 
             let root = &roots[candidate.root_index];
 
-            match build_photo_record(root, &candidate.path, use_root_prefix) {
+            match build_hashed_photo_record(root, &candidate.path, use_root_prefix) {
                 Ok((hash, record)) => {
                     let mut guard = files_by_hash.lock().map_err(|_| {
                         "Le regroupement des hash est devenu indisponible.".to_string()
@@ -347,11 +362,6 @@ fn scan_photo_library_impl(
         return Err(error);
     }
 
-    let warnings = Arc::try_unwrap(warning_buffer)
-        .map_err(|_| "Impossible de finaliser les warnings du scan.".to_string())?
-        .into_inner()
-        .map_err(|_| "Le buffer de warnings est devenu indisponible.".to_string())?;
-
     let groups = {
         let guard = files_by_hash
             .lock()
@@ -359,23 +369,146 @@ fn scan_photo_library_impl(
         build_duplicate_groups(&guard, None)
     };
 
-    let duplicate_groups = groups.len();
-    let duplicates_to_remove = groups.iter().map(|group| group.file_count - 1).sum();
-    let reclaimable_bytes = groups.iter().map(|group| group.reclaimable_bytes).sum();
-    let skipped_files = skipped_counter.load(Ordering::SeqCst);
-
     emit_scan_progress(
         app,
         ScanProgressPayload::new(
-            "complete",
-            format!("Analyse terminee: {duplicate_groups} groupe(s) de doublons detecte(s)."),
-            hash_candidate_files,
-            Some(hash_candidate_files),
+            "similarity",
+            format!(
+                "Verification des copies reduites ou recompressees sur {} photo(s).",
+                supported_files
+            ),
+            0,
+            Some(supported_files),
             None,
             total_files_seen,
             supported_files,
             hash_candidate_files,
             build_duplicate_groups_preview(&groups),
+        ),
+    );
+
+    let similarity_last_emitted = Arc::new(AtomicUsize::new(0));
+    let similarity_processed_counter = Arc::new(AtomicUsize::new(0));
+    let similar_records = Arc::new(Mutex::new(Vec::<SimilarPhotoRecord>::new()));
+
+    let similarity_result = pool.install(|| {
+        supported_candidates
+            .par_iter()
+            .try_for_each(|candidate| -> Result<(), String> {
+                if is_scan_cancelled(cancel_flag) {
+                    return Err(SCAN_CANCELLED_MESSAGE.to_string());
+                }
+
+                let root = &roots[candidate.root_index];
+
+                match build_similar_photo_record(root, &candidate.path, use_root_prefix) {
+                    Ok(Some(record)) => {
+                        let mut guard = similar_records.lock().map_err(|_| {
+                            "Le buffer de similarite est devenu indisponible.".to_string()
+                        })?;
+                        guard.push(record);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let mut warning_guard = warning_buffer.lock().map_err(|_| {
+                            "Le buffer de warnings est devenu indisponible.".to_string()
+                        })?;
+                        push_warning(
+                            &mut warning_guard,
+                            format!("{}: {error}", candidate.path.to_string_lossy()),
+                        );
+                    }
+                }
+
+                let processed_items = similarity_processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+                if should_emit_similarity_progress(processed_items, supported_files)
+                    && similarity_last_emitted.swap(processed_items, Ordering::SeqCst) < processed_items
+                {
+                    emit_scan_progress(
+                        app,
+                        ScanProgressPayload::new(
+                            "similarity",
+                            format!(
+                                "Comparaison visuelle {processed_items}/{supported_files}..."
+                            ),
+                            processed_items,
+                            Some(supported_files),
+                            Some(candidate.display_path.clone()),
+                            total_files_seen,
+                            supported_files,
+                            hash_candidate_files,
+                            build_duplicate_groups_preview(&groups),
+                        ),
+                    );
+                }
+
+                if is_scan_cancelled(cancel_flag) {
+                    return Err(SCAN_CANCELLED_MESSAGE.to_string());
+                }
+
+                Ok(())
+            })
+    });
+
+    if let Err(error) = similarity_result {
+        if error == SCAN_CANCELLED_MESSAGE {
+            emit_scan_progress(
+                app,
+                ScanProgressPayload::new(
+                    "cancelled",
+                    "Analyse annulee par l'utilisateur.",
+                    similarity_processed_counter.load(Ordering::SeqCst),
+                    Some(supported_files),
+                    None,
+                    total_files_seen,
+                    supported_files,
+                    hash_candidate_files,
+                    build_duplicate_groups_preview(&groups),
+                ),
+            );
+        }
+
+        return Err(error);
+    }
+
+    let warnings = Arc::try_unwrap(warning_buffer)
+        .map_err(|_| "Impossible de finaliser les warnings du scan.".to_string())?
+        .into_inner()
+        .map_err(|_| "Le buffer de warnings est devenu indisponible.".to_string())?;
+
+    let duplicate_groups = groups.len();
+    let skipped_files = skipped_counter.load(Ordering::SeqCst);
+
+    let similar_records = Arc::try_unwrap(similar_records)
+        .map_err(|_| "Impossible de finaliser les signatures de similarite.".to_string())?
+        .into_inner()
+        .map_err(|_| "Le buffer de similarite est devenu indisponible.".to_string())?;
+    let reduced_groups = build_reduced_copy_groups(&groups, similar_records, None);
+    let exact_groups = duplicate_groups;
+    let reduced_group_count = reduced_groups.len();
+
+    let mut all_groups = groups;
+    all_groups.extend(reduced_groups);
+    sort_groups_for_display(&mut all_groups);
+
+    let duplicates_to_remove = all_groups.iter().map(|group| group.file_count - 1).sum();
+    let reclaimable_bytes = all_groups.iter().map(|group| group.reclaimable_bytes).sum();
+
+    emit_scan_progress(
+        app,
+        ScanProgressPayload::new(
+            "complete",
+            format!(
+                "Analyse terminee: {exact_groups} doublon(s) exact(s) et {reduced_group_count} copie(s) reduite(s) detecte(s)."
+            ),
+            supported_files,
+            Some(supported_files),
+            None,
+            total_files_seen,
+            supported_files,
+            hash_candidate_files,
+            build_duplicate_groups_preview(&all_groups),
         ),
     );
 
@@ -391,12 +524,14 @@ fn scan_photo_library_impl(
         summary: ScanSummary {
             total_files_seen,
             supported_files,
-            duplicate_groups,
+            duplicate_groups: all_groups.len(),
+            exact_groups,
+            reduced_groups: reduced_group_count,
             duplicates_to_remove,
             reclaimable_bytes,
             skipped_files,
         },
-        groups,
+        groups: all_groups,
         warnings,
     })
 }
@@ -470,6 +605,7 @@ fn collect_supported_photo_paths(
     warnings: &mut Vec<String>,
 ) -> Result<ScanInventory, String> {
     let mut size_groups: HashMap<u64, Vec<ScanCandidate>> = HashMap::new();
+    let mut supported_candidates = Vec::new();
     let mut total_files_seen = 0usize;
     let mut supported_files = 0usize;
     let mut skipped_files = 0usize;
@@ -502,18 +638,20 @@ fn collect_supported_photo_paths(
                 match entry.metadata() {
                     Ok(metadata) => {
                         supported_files += 1;
+                        let candidate = ScanCandidate {
+                            path: entry.path().to_path_buf(),
+                            root_index,
+                            display_path: display_path_for_root(
+                                root,
+                                entry.path(),
+                                use_root_prefix,
+                            ),
+                        };
+                        supported_candidates.push(candidate.clone());
                         size_groups
                             .entry(metadata.len())
                             .or_default()
-                            .push(ScanCandidate {
-                                path: entry.path().to_path_buf(),
-                                root_index,
-                                display_path: display_path_for_root(
-                                    root,
-                                    entry.path(),
-                                    use_root_prefix,
-                                ),
-                            });
+                            .push(candidate);
                     }
                     Err(error) => {
                         skipped_files += 1;
@@ -574,6 +712,7 @@ fn collect_supported_photo_paths(
     );
 
     Ok(ScanInventory {
+        supported_candidates,
         hash_candidates,
         total_files_seen,
         supported_files,
@@ -615,6 +754,7 @@ fn build_duplicate_groups(
 
             Some(DuplicateGroup {
                 hash: hash.clone(),
+                group_kind: "exact".to_string(),
                 file_count: files.len(),
                 total_size_bytes,
                 reclaimable_bytes,
@@ -626,13 +766,80 @@ fn build_duplicate_groups(
         })
         .collect();
 
-    groups.sort_by(|left, right| {
-        right
-            .reclaimable_bytes
-            .cmp(&left.reclaimable_bytes)
-            .then_with(|| right.file_count.cmp(&left.file_count))
-            .then_with(|| left.keep_relative_path.cmp(&right.keep_relative_path))
-    });
+    sort_groups_for_display(&mut groups);
+
+    if let Some(limit) = limit {
+        groups.truncate(limit);
+    }
+
+    groups
+}
+
+fn build_reduced_copy_groups(
+    exact_groups: &[DuplicateGroup],
+    similar_records: Vec<SimilarPhotoRecord>,
+    limit: Option<usize>,
+) -> Vec<DuplicateGroup> {
+    let exact_member_paths: HashSet<&str> = exact_groups
+        .iter()
+        .flat_map(|group| group.files.iter().map(|file| file.path.as_str()))
+        .collect();
+    let exact_keep_paths: HashSet<&str> = exact_groups
+        .iter()
+        .map(|group| group.keep_path.as_str())
+        .collect();
+
+    let mut representative_records = Vec::new();
+
+    for similar_record in similar_records {
+        let path = similar_record.record.path.as_str();
+        if exact_member_paths.contains(path) && !exact_keep_paths.contains(path) {
+            continue;
+        }
+
+        representative_records.push(similar_record);
+    }
+
+    let mut buckets: HashMap<String, Vec<PhotoRecord>> = HashMap::new();
+    for similar_record in representative_records {
+        let bucket_key = format!(
+            "visual-{:016x}-{}",
+            similar_record.signature, similar_record.aspect_ratio_key
+        );
+        buckets
+            .entry(bucket_key)
+            .or_default()
+            .push(similar_record.record);
+    }
+
+    let mut groups: Vec<DuplicateGroup> = buckets
+        .into_iter()
+        .filter_map(|(bucket_key, files)| {
+            if files.len() < 2 {
+                return None;
+            }
+
+            let mut files = files;
+            files.sort_by(compare_keep_candidates);
+            let keep_file = files.first()?.clone();
+            let total_size_bytes = files.iter().map(|file| file.size_bytes).sum();
+            let reclaimable_bytes = files.iter().skip(1).map(|file| file.size_bytes).sum();
+
+            Some(DuplicateGroup {
+                hash: bucket_key,
+                group_kind: "reduced".to_string(),
+                file_count: files.len(),
+                total_size_bytes,
+                reclaimable_bytes,
+                keep_path: keep_file.path.clone(),
+                keep_relative_path: keep_file.relative_path.clone(),
+                keep_reason: explain_reduced_copy_choice(&keep_file, &files),
+                files,
+            })
+        })
+        .collect();
+
+    sort_groups_for_display(&mut groups);
 
     if let Some(limit) = limit {
         groups.truncate(limit);
@@ -720,7 +927,7 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_photo_record(
+fn build_hashed_photo_record(
     root: &ScanRoot,
     path: &Path,
     use_root_prefix: bool,
@@ -728,6 +935,42 @@ fn build_photo_record(
     let canonical_path = path
         .canonicalize()
         .map_err(|error| format!("chemin non resolu ({error})"))?;
+    let record = build_photo_record_metadata(root, &canonical_path, use_root_prefix)?;
+    let hash = compute_sha256(&canonical_path)?;
+    Ok((hash, record))
+}
+
+fn build_similar_photo_record(
+    root: &ScanRoot,
+    path: &Path,
+    use_root_prefix: bool,
+) -> Result<Option<SimilarPhotoRecord>, String> {
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("chemin non resolu ({error})"))?;
+    let record = build_photo_record_metadata(root, &canonical_path, use_root_prefix)?;
+    let Some((signature, aspect_ratio_key)) = compute_visual_signature(
+        &canonical_path,
+        &record.extension,
+        record.width,
+        record.height,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(SimilarPhotoRecord {
+        signature,
+        aspect_ratio_key,
+        record,
+    }))
+}
+
+fn build_photo_record_metadata(
+    root: &ScanRoot,
+    canonical_path: &Path,
+    use_root_prefix: bool,
+) -> Result<PhotoRecord, String> {
     let metadata = fs::metadata(&canonical_path)
         .map_err(|error| format!("metadata indisponibles ({error})"))?;
     let extension = canonical_path
@@ -741,31 +984,27 @@ fn build_photo_record(
     let quality_score = compute_quality_score(&extension, dimensions, size_bytes);
     let quality_reason = build_quality_reason(&extension, dimensions, size_bytes);
     let relative_path = display_path_for_root(root, &canonical_path, use_root_prefix);
-    let hash = compute_sha256(&canonical_path)?;
 
-    Ok((
-        hash,
-        PhotoRecord {
-            path: path_to_string(&canonical_path),
-            relative_path,
-            file_name: canonical_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            extension,
-            size_bytes,
-            width: dimensions.map(|(width, _)| width),
-            height: dimensions.map(|(_, height)| height),
-            modified_unix_ms: metadata
-                .modified()
-                .ok()
-                .and_then(|timestamp| timestamp.duration_since(UNIX_EPOCH).ok())
-                .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
-            quality_score,
-            quality_reason,
-        },
-    ))
+    Ok(PhotoRecord {
+        path: path_to_string(&canonical_path),
+        relative_path,
+        file_name: canonical_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        extension,
+        size_bytes,
+        width: dimensions.map(|(width, _)| width),
+        height: dimensions.map(|(_, height)| height),
+        modified_unix_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|timestamp| timestamp.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+        quality_score,
+        quality_reason,
+    })
 }
 
 fn read_dimensions(path: &Path, extension: &str) -> Option<(u32, u32)> {
@@ -792,6 +1031,45 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn compute_visual_signature(
+    path: &Path,
+    extension: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Option<(u64, String)>, String> {
+    if !matches!(extension, "jpg" | "jpeg" | "png") {
+        return Ok(None);
+    }
+
+    let (width, height) = match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
+        _ => return Ok(None),
+    };
+
+    let image = ImageReader::open(path)
+        .map_err(|error| format!("ouverture image impossible ({error})"))?
+        .with_guessed_format()
+        .map_err(|error| format!("format image inconnu ({error})"))?
+        .decode()
+        .map_err(|error| format!("decodage image impossible ({error})"))?;
+
+    let thumbnail = image
+        .resize_exact(8, 8, FilterType::Triangle)
+        .grayscale()
+        .to_luma8();
+    let average = thumbnail.pixels().map(|pixel| u32::from(pixel.0[0])).sum::<u32>() / 64;
+    let mut signature = 0u64;
+
+    for pixel in thumbnail.pixels() {
+        signature <<= 1;
+        if u32::from(pixel.0[0]) >= average {
+            signature |= 1;
+        }
+    }
+
+    Ok(Some((signature, normalized_aspect_ratio_key(width, height))))
 }
 
 fn compute_quality_score(extension: &str, dimensions: Option<(u32, u32)>, size_bytes: u64) -> u64 {
@@ -864,8 +1142,34 @@ fn explain_keep_choice(keep_file: &PhotoRecord, files: &[PhotoRecord]) -> String
     }
 }
 
+fn explain_reduced_copy_choice(keep_file: &PhotoRecord, files: &[PhotoRecord]) -> String {
+    let lower_quality_versions = files.iter().filter(|file| file.path != keep_file.path).count();
+
+    format!(
+        "PicMan a reconnu {} version(s) visuellement tres proche(s). `{}` est conservee car elle offre la meilleure definition ou compression du groupe: {}.",
+        lower_quality_versions,
+        keep_file.relative_path,
+        keep_file.quality_reason
+    )
+}
+
 fn path_depth(path: &str) -> usize {
     Path::new(path).components().count()
+}
+
+fn normalized_aspect_ratio_key(width: u32, height: u32) -> String {
+    let divisor = greatest_common_divisor(width, height).max(1);
+    format!("{}:{}", width / divisor, height / divisor)
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+
+    left
 }
 
 fn create_quarantine_directory(batch_directory: &Path) -> Result<(), String> {
@@ -961,6 +1265,12 @@ fn should_emit_hash_progress(processed_items: usize, total_items: usize) -> bool
         || processed_items % HASH_PROGRESS_EMIT_INTERVAL == 0
 }
 
+fn should_emit_similarity_progress(processed_items: usize, total_items: usize) -> bool {
+    processed_items == 1
+        || processed_items == total_items
+        || processed_items % SIMILARITY_PROGRESS_EMIT_INTERVAL == 0
+}
+
 fn display_path_for_root(root: &ScanRoot, path: &Path, use_root_prefix: bool) -> String {
     let relative = path_to_string(path.strip_prefix(&root.canonical_path).unwrap_or(path));
     if use_root_prefix {
@@ -981,6 +1291,16 @@ fn recommended_hash_parallelism() -> usize {
         .map(|value| value.get())
         .unwrap_or(2)
         .clamp(1, 4)
+}
+
+fn sort_groups_for_display(groups: &mut [DuplicateGroup]) {
+    groups.sort_by(|left, right| {
+        right
+            .reclaimable_bytes
+            .cmp(&left.reclaimable_bytes)
+            .then_with(|| right.file_count.cmp(&left.file_count))
+            .then_with(|| left.keep_relative_path.cmp(&right.keep_relative_path))
+    });
 }
 
 fn is_scan_cancelled(cancel_flag: &Arc<AtomicBool>) -> bool {
@@ -1149,5 +1469,72 @@ mod tests {
             .collect();
 
         assert_eq!(paths, vec!["b.jpg".to_string(), "c.jpg".to_string()]);
+    }
+
+    #[test]
+    fn reduced_copy_groups_merge_same_visual_signature() {
+        let stronger = PhotoRecord {
+            path: r"C:\Photos\best.jpg".into(),
+            relative_path: r"best.jpg".into(),
+            file_name: "best.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 4_000_000,
+            width: Some(4000),
+            height: Some(3000),
+            modified_unix_ms: None,
+            quality_score: compute_quality_score("jpg", Some((4000, 3000)), 4_000_000),
+            quality_reason: String::new(),
+        };
+        let reduced = PhotoRecord {
+            path: r"C:\Photos\best-small.jpg".into(),
+            relative_path: r"best-small.jpg".into(),
+            file_name: "best-small.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 800_000,
+            width: Some(1600),
+            height: Some(1200),
+            modified_unix_ms: None,
+            quality_score: compute_quality_score("jpg", Some((1600, 1200)), 800_000),
+            quality_reason: String::new(),
+        };
+        let unrelated = PhotoRecord {
+            path: r"C:\Photos\other.jpg".into(),
+            relative_path: r"other.jpg".into(),
+            file_name: "other.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 750_000,
+            width: Some(1600),
+            height: Some(900),
+            modified_unix_ms: None,
+            quality_score: compute_quality_score("jpg", Some((1600, 900)), 750_000),
+            quality_reason: String::new(),
+        };
+
+        let groups = build_reduced_copy_groups(
+            &[],
+            vec![
+                SimilarPhotoRecord {
+                    signature: 0x1234,
+                    aspect_ratio_key: "4:3".into(),
+                    record: stronger.clone(),
+                },
+                SimilarPhotoRecord {
+                    signature: 0x1234,
+                    aspect_ratio_key: "4:3".into(),
+                    record: reduced.clone(),
+                },
+                SimilarPhotoRecord {
+                    signature: 0x1234,
+                    aspect_ratio_key: "16:9".into(),
+                    record: unrelated,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_kind, "reduced");
+        assert_eq!(groups[0].keep_path, stronger.path);
+        assert_eq!(groups[0].file_count, 2);
     }
 }

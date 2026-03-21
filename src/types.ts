@@ -13,6 +13,7 @@ export interface PhotoRecord {
 
 export interface DuplicateGroup {
   hash: string;
+  groupKind: "exact" | "reduced";
   fileCount: number;
   totalSizeBytes: number;
   reclaimableBytes: number;
@@ -26,6 +27,8 @@ export interface ScanSummary {
   totalFilesSeen: number;
   supportedFiles: number;
   duplicateGroups: number;
+  exactGroups: number;
+  reducedGroups: number;
   duplicatesToRemove: number;
   reclaimableBytes: number;
   skippedFiles: number;

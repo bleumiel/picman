@@ -8,7 +8,7 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 
 - MVP en application desktop locale
 - Stack retenue: TypeScript + Tauri
-- Perimetre MVP: doublons exacts uniquement
+- Perimetre MVP: doublons exacts + copies reduites/recompressees detectees prudemment
 - Formats MVP: JPEG, PNG et HEIC
 - Suppression non destructive recommandee
 
@@ -16,12 +16,12 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 
 - Le repo GitHub `https://github.com/bleumiel/picman.git` existe
 - Le projet local est initialise et contient maintenant un premier socle Tauri + React
-- Le moteur MVP actuel detecte les doublons exacts et peut mettre les copies en quarantaine
+- Le moteur MVP actuel detecte les doublons exacts, reconnait aussi de facon conservative certaines copies reduites ou recompressees, et peut mettre les copies en quarantaine
 - Le scan photo est maintenant execute hors du thread UI avec une progression visible en temps reel pour eviter l'etat "Ne repond pas"
 - L'UI propose maintenant un picker de dossier natif et des miniatures pour faciliter la revue des groupes
 - Les groupes de doublons commencent a apparaitre pendant l'analyse et le scan evite maintenant de hasher les fichiers dont la taille est unique
 - Le hash des candidats est maintenant parallélisé de façon modérée et une analyse en cours peut être annulée depuis l'interface
-- Une meme analyse peut maintenant couvrir plusieurs dossiers a la fois, avec quarantaine dediee par racine, annulation plus reactive grace a des previews live limitees et tri des groupes detectes dans l'interface
+- Une meme analyse peut maintenant couvrir plusieurs dossiers a la fois, avec quarantaine dediee par racine, annulation plus reactive grace a des previews live limitees, tri des groupes detectes dans l'interface et detection conservative des copies reduites/recompressees sur JPEG/PNG
 
 ## Phasage recommande
 
@@ -39,7 +39,7 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 
 ### Phase 2 - Evolutions
 
-- Detection de doublons visuellement proches
+- Detection de doublons visuellement proches avec plus de tolerance (recadrage, variantes plus complexes)
 - Prise en charge de formats supplementaires comme RAW
 - Rescans incrementaux et optimisation grands volumes
 - Regles de priorite configurables
@@ -78,4 +78,4 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
    - Tests Rust unitaires ajoutes; journalisation detaillee a renforcer dans une iteration suivante.
 
 11. `polir-experience-de-scan`
-   - Progression de scan visible, picker multi-dossiers, miniatures de groupe, pre-affichage des doublons pendant le scan, filtrage par taille, hash parallele modere, annulation reactive, quarantaine par racine et tri des groupes en place; prochaine amelioration naturelle: copies reduites/recompressees, progression de quarantaine, selection fine et parallelisation configurable.
+   - Progression de scan visible, picker multi-dossiers, miniatures de groupe, pre-affichage des doublons pendant le scan, filtrage par taille, hash parallele modere, annulation reactive, quarantaine par racine, tri des groupes et detection conservative des copies reduites/recompressees en place; prochaines ameliorations naturelles: progression de quarantaine, selection fine, support HEIC/RAW pour la similarite et parallelisation configurable.

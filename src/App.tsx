@@ -29,8 +29,10 @@ function App() {
   const removablePaths = useMemo(
     () =>
       report
-        ? report.groups.flatMap((group) =>
-            group.files.filter((file) => file.path !== group.keepPath).map((file) => file.path),
+        ? dedupePaths(
+            report.groups.flatMap((group) =>
+              group.files.filter((file) => file.path !== group.keepPath).map((file) => file.path),
+            ),
           )
         : [],
     [report],
@@ -366,11 +368,15 @@ function App() {
               value={report.summary.supportedFiles.toString()}
             />
             <SummaryCard
-              label="Groupes de doublons"
-              value={report.summary.duplicateGroups.toString()}
+              label="Doublons exacts"
+              value={report.summary.exactGroups.toString()}
             />
             <SummaryCard
-              label="Copies a retirer"
+              label="Copies reduites"
+              value={report.summary.reducedGroups.toString()}
+            />
+            <SummaryCard
+              label="Versions a retirer"
               value={report.summary.duplicatesToRemove.toString()}
             />
             <SummaryCard
@@ -388,7 +394,7 @@ function App() {
               <h2>Action recommande</h2>
               <p>
                 PicMan conservera le meilleur candidat de chaque groupe et deplacera les autres
-                copies vers {formatPathList(report.quarantineRoots)}.
+                versions vers {formatPathList(report.quarantineRoots)}.
               </p>
               {lastQuarantineResult ? (
                 <p className="helper-text">
@@ -402,7 +408,7 @@ function App() {
               disabled={isScanning || isQuarantining || removablePaths.length === 0}
               onClick={() => quarantinePaths(removablePaths)}
             >
-              {isQuarantining ? "Deplacement..." : "Mettre tous les doublons en quarantaine"}
+              {isQuarantining ? "Deplacement..." : "Mettre toutes les versions en quarantaine"}
             </button>
           </section>
 
@@ -423,8 +429,8 @@ function App() {
                 <h2>Groupes detectes</h2>
                 <p>
                   {report.groups.length === 0
-                    ? "Aucun doublon exact detecte dans ces dossiers."
-                    : `${report.groups.length} groupe(s) prets a etre verifies.`}
+                    ? "Aucun doublon exact ni copie reduite detecte dans ces dossiers."
+                    : formatGroupBreakdown(report.summary)}
                 </p>
               </div>
               {report.groups.length > 0 ? (
@@ -577,13 +583,19 @@ function DuplicateGroupList({
         const duplicatePaths = group.files
           .filter((file) => file.path !== group.keepPath)
           .map((file) => file.path);
+        const groupKindLabel = getGroupKindLabel(group.groupKind);
+        const removableLabel = getRemovableLabel(group.groupKind);
+        const groupTagClass = group.groupKind === "reduced" ? "derived-tag" : "exact-tag";
 
         return (
           <article className="group-card" key={group.hash}>
             <header className="group-header">
               <div>
                 <p className="group-index">Groupe {index + 1}</p>
-                <h3>{shortHash(group.hash)}</h3>
+                <div className="group-title-row">
+                  <h3>{shortHash(group.hash)}</h3>
+                  <span className={`tag ${groupTagClass}`}>{groupKindLabel}</span>
+                </div>
               </div>
               <div className="group-stats">
                 <span>{group.fileCount} fichiers</span>
@@ -602,7 +614,7 @@ function DuplicateGroupList({
                 <div className="group-preview-copy">
                   <p className="eyebrow">Apercu du groupe</p>
                   <strong>{group.keepRelativePath}</strong>
-                  <p>La miniature principale reprend le fichier recommande a conserver.</p>
+                  <p>La miniature principale reprend la meilleure version recommandee.</p>
                 </div>
               </div>
 
@@ -615,7 +627,7 @@ function DuplicateGroupList({
                       key={`${group.hash}-${file.path}`}
                       path={file.path}
                       alt={`Miniature de ${file.relativePath}`}
-                      badge={isKept ? "A garder" : "Copie"}
+                      badge={isKept ? "A garder" : removableLabel}
                       className={isKept ? "strip-thumbnail keep" : "strip-thumbnail"}
                     />
                   );
@@ -634,7 +646,7 @@ function DuplicateGroupList({
                 disabled={isQuarantining || duplicatePaths.length === 0}
                 onClick={() => onQuarantineGroup(duplicatePaths)}
               >
-                Mettre les autres copies en quarantaine
+                Mettre les autres versions en quarantaine
               </button>
             </section>
 
@@ -647,8 +659,16 @@ function DuplicateGroupList({
                     <div className="file-main">
                       <div className="file-title-row">
                         <strong>{file.relativePath}</strong>
-                        <span className={`tag ${isKept ? "keep-tag" : "duplicate-tag"}`}>
-                          {isKept ? "A conserver" : "Doublon"}
+                        <span
+                          className={`tag ${
+                            isKept
+                              ? "keep-tag"
+                              : group.groupKind === "reduced"
+                                ? "derived-tag"
+                                : "duplicate-tag"
+                          }`}
+                        >
+                          {isKept ? "A conserver" : removableLabel}
                         </span>
                       </div>
                       <p>{file.qualityReason}</p>
@@ -702,6 +722,8 @@ function getProgressTitle(phase: string) {
       return "Preparation du scan";
     case "hashing":
       return "Analyse des photos";
+    case "similarity":
+      return "Comparaison visuelle";
     case "grouping":
       return "Regroupement des doublons";
     case "cancelled":
@@ -816,6 +838,32 @@ function formatPathList(paths: string[]) {
   }
 
   return `${paths[0]} et ${paths.length - 1} autre(s) dossier(s)`;
+}
+
+function formatGroupBreakdown(summary: ScanReport["summary"]) {
+  const parts = [];
+
+  if (summary.exactGroups > 0) {
+    parts.push(`${summary.exactGroups} doublon(s) exact(s)`);
+  }
+
+  if (summary.reducedGroups > 0) {
+    parts.push(`${summary.reducedGroups} copie(s) reduite(s)`);
+  }
+
+  if (parts.length === 0) {
+    return "Aucun groupe detecte.";
+  }
+
+  return `${parts.join(" et ")} pret(s) a etre verifies.`;
+}
+
+function getGroupKindLabel(groupKind: "exact" | "reduced") {
+  return groupKind === "reduced" ? "Copie reduite" : "Doublon exact";
+}
+
+function getRemovableLabel(groupKind: "exact" | "reduced") {
+  return groupKind === "reduced" ? "Version derivee" : "Doublon";
 }
 
 function sortGroups(groups: ScanReport["groups"], sortKey: ResultSortKey) {
