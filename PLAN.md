@@ -2,14 +2,13 @@
 
 ## Objectif
 
-PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons, en choisissant la meilleure version a conserver, puis en proposant une suppression sure et reversible.
+PicMan doit aider a nettoyer des dossiers locaux en detectant les doublons, en choisissant la meilleure version a conserver, puis en proposant une suppression sure et reversible.
 
 ## Decisions retenues
 
 - MVP en application desktop locale
 - Stack retenue: TypeScript + Tauri
-- Perimetre MVP: doublons exacts + copies reduites/recompressees detectees prudemment
-- Formats MVP: JPEG, PNG et HEIC
+- Perimetre MVP: doublons exacts sur tous types de fichiers + copies reduites/recompressees detectees prudemment sur les images (JPEG, PNG, HEIC)
 - Suppression non destructive recommandee
 
 ## Etat actuel
@@ -17,11 +16,12 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 - Le repo GitHub `https://github.com/bleumiel/picman.git` existe
 - Le projet local est initialise et contient maintenant un premier socle Tauri + React
 - Le moteur MVP actuel detecte les doublons exacts, reconnait aussi de facon conservative certaines copies reduites ou recompressees, et peut mettre les copies en quarantaine
-- Le scan photo est maintenant execute hors du thread UI avec une progression visible en temps reel pour eviter l'etat "Ne repond pas"
+- Le scan est maintenant execute hors du thread UI avec une progression visible en temps reel pour eviter l'etat "Ne repond pas"
 - L'UI propose maintenant un picker de dossier natif et des miniatures pour faciliter la revue des groupes
 - Les groupes de doublons commencent a apparaitre pendant l'analyse et le scan evite maintenant de hasher les fichiers dont la taille est unique
-- Le hash des candidats est maintenant parallélisé de façon modérée et une analyse en cours peut être annulée depuis l'interface
+- Le hash des candidats est maintenant parallelise de facon moderee et une analyse en cours peut etre annulee depuis l'interface
 - Une meme analyse peut maintenant couvrir plusieurs dossiers a la fois, avec quarantaine dediee par racine, annulation plus reactive grace a des previews live limitees, tri des groupes detectes dans l'interface et detection conservative des copies reduites/recompressees sur JPEG/PNG
+- La detection de doublons exacts couvre desormais tous les types de fichiers (pas seulement les images); la detection de copies reduites reste limitee aux images JPEG/PNG
 
 ## Phasage recommande
 
@@ -30,8 +30,8 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 - Synchroniser et maintenir le repo local avec GitHub
 - Stabiliser le socle TypeScript + Tauri
 - Scanner des dossiers locaux
-- Indexer les photos et metadonnees principales
-- Detecter les doublons exacts
+- Indexer les fichiers et metadonnees principales
+- Detecter les doublons exacts (tous types de fichiers)
 - Calculer un score de qualite explicable
 - Proposer automatiquement le fichier a garder
 - Permettre une revue manuelle avant suppression
@@ -40,7 +40,7 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 ### Phase 2 - Evolutions
 
 - Detection de doublons visuellement proches avec plus de tolerance (recadrage, variantes plus complexes)
-- Prise en charge de formats supplementaires comme RAW
+- Prise en charge de formats supplementaires pour la detection de similarite (HEIC, RAW)
 - Rescans incrementaux et optimisation grands volumes
 - Regles de priorite configurables
 - Journalisation/audit plus riche
@@ -79,3 +79,6 @@ PicMan doit aider a nettoyer des dossiers photo locaux en detectant les doublons
 
 11. `polir-experience-de-scan`
    - Progression de scan visible, picker multi-dossiers, miniatures de groupe, pre-affichage des doublons pendant le scan, filtrage par taille, hash parallele modere, annulation reactive, quarantaine par racine, tri des groupes et detection conservative des copies reduites/recompressees en place; prochaines ameliorations naturelles: progression de quarantaine, selection fine, support HEIC/RAW pour la similarite et parallelisation configurable.
+
+12. `elargir-detection-tous-fichiers`
+   - Detection de doublons exacts elargie a tous les types de fichiers (plus seulement les images). Scoring qualite adapte pour les non-images (taille uniquement). Labels UI mis a jour.

@@ -90,7 +90,7 @@ function App() {
       const selected = await open({
         directory: true,
         multiple: true,
-        title: "Choisir un ou plusieurs dossiers photo",
+        title: "Choisir un ou plusieurs dossiers a analyser",
       });
 
       if (typeof selected === "string") {
@@ -149,7 +149,7 @@ function App() {
     setIsCancelling(false);
 
     if (selectedRoots.length === 0) {
-      setError("Ajoute au moins un dossier photo a analyser.");
+      setError("Ajoute au moins un dossier a analyser.");
       return;
     }
 
@@ -221,17 +221,17 @@ function App() {
       <section className="hero">
         <div>
           <p className="eyebrow">PicMan MVP</p>
-          <h1>Nettoyer ses dossiers photo sans supprimer a l&apos;aveugle.</h1>
+          <h1>Nettoyer ses dossiers sans supprimer a l&apos;aveugle.</h1>
           <p className="hero-copy">
-            Selectionne un ou plusieurs dossiers locaux, lance une analyse des formats JPEG, PNG
-            et HEIC, puis mets les doublons exacts en quarantaine en gardant une copie de
+            Selectionne un ou plusieurs dossiers locaux, lance une analyse de tous les fichiers,
+            puis mets les doublons exacts en quarantaine en gardant une copie de
             reference.
           </p>
         </div>
         <div className="hero-card">
           <span className="hero-card-label">Moteur actuel</span>
-          <strong>Doublons exacts uniquement</strong>
-          <p>Filtrage par taille, hash parallele modere, previsualisation live et annulation.</p>
+          <strong>Doublons exacts + copies reduites</strong>
+          <p>Tous types de fichiers, hash parallele modere, previsualisation live et annulation.</p>
         </div>
       </section>
 
@@ -333,7 +333,7 @@ function App() {
 
           <div className="progress-meta">
             <span>{formatProgressCounts(scanProgress)}</span>
-            <span>{scanProgress.supportedFiles} photo(s) prises en charge reperees</span>
+            <span>{scanProgress.scannedFiles} fichier(s) pris en charge</span>
             <span>{scanProgress.hashCandidateFiles} candidate(s) a hasher</span>
           </div>
 
@@ -364,8 +364,8 @@ function App() {
           <section className="summary-grid">
             <SummaryCard label="Fichiers vus" value={report.summary.totalFilesSeen.toString()} />
             <SummaryCard
-              label="Photos prises en charge"
-              value={report.summary.supportedFiles.toString()}
+              label="Fichiers analyses"
+              value={report.summary.scannedFiles.toString()}
             />
             <SummaryCard
               label="Doublons exacts"
@@ -384,7 +384,7 @@ function App() {
               value={formatBytes(report.summary.reclaimableBytes)}
             />
             <SummaryCard
-              label="Ignores / non pris en charge"
+              label="Fichiers inaccessibles"
               value={report.summary.skippedFiles.toString()}
             />
           </section>
@@ -443,8 +443,8 @@ function App() {
                   >
                     <option value="reclaimable-desc">Espace recuperable (desc)</option>
                     <option value="files-desc">Nombre de fichiers (desc)</option>
-                    <option value="modified-desc">Date de la meilleure photo (recent)</option>
-                    <option value="modified-asc">Date de la meilleure photo (ancien)</option>
+                    <option value="modified-desc">Date du meilleur fichier (recent)</option>
+                    <option value="modified-asc">Date du meilleur fichier (ancien)</option>
                     <option value="keep-path-asc">Chemin du fichier garde (A-Z)</option>
                     <option value="keep-path-desc">Chemin du fichier garde (Z-A)</option>
                   </select>
@@ -456,7 +456,7 @@ function App() {
               <div className="empty-state">
                 <strong>Rien a nettoyer ici.</strong>
                 <p>
-                  Le scan a termine sans trouver de doublons exacts sur les formats pris en charge.
+                  Le scan a termine sans trouver de doublons exacts.
                 </p>
               </div>
             ) : (
@@ -472,8 +472,8 @@ function App() {
         <section className="empty-state pre-scan">
           <strong>En attente d&apos;un premier scan.</strong>
           <p>
-            PicMan commencera par parcourir les dossiers, calculer les empreintes des images prises
-            en charge puis regrouper les doublons exacts.
+            PicMan commencera par parcourir les dossiers, calculer les empreintes des fichiers
+            puis regrouper les doublons exacts.
           </p>
         </section>
       ) : null}
@@ -499,8 +499,8 @@ function App() {
                 >
                   <option value="reclaimable-desc">Espace recuperable (desc)</option>
                   <option value="files-desc">Nombre de fichiers (desc)</option>
-                  <option value="modified-desc">Date de la meilleure photo (recent)</option>
-                  <option value="modified-asc">Date de la meilleure photo (ancien)</option>
+                  <option value="modified-desc">Date du meilleur fichier (recent)</option>
+                  <option value="modified-asc">Date du meilleur fichier (ancien)</option>
                   <option value="keep-path-asc">Chemin du fichier garde (A-Z)</option>
                   <option value="keep-path-desc">Chemin du fichier garde (Z-A)</option>
                 </select>
@@ -710,7 +710,7 @@ function createPendingProgress(message: string): ScanProgress {
     totalItems: null,
     currentPath: null,
     totalFilesSeen: 0,
-    supportedFiles: 0,
+    scannedFiles: 0,
     hashCandidateFiles: 0,
     previewGroups: [],
   };
@@ -721,7 +721,7 @@ function getProgressTitle(phase: string) {
     case "counting":
       return "Preparation du scan";
     case "hashing":
-      return "Analyse des photos";
+      return "Analyse des fichiers";
     case "similarity":
       return "Comparaison visuelle";
     case "grouping":

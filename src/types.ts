@@ -25,7 +25,7 @@ export interface DuplicateGroup {
 
 export interface ScanSummary {
   totalFilesSeen: number;
-  supportedFiles: number;
+  scannedFiles: number;
   duplicateGroups: number;
   exactGroups: number;
   reducedGroups: number;
@@ -49,7 +49,7 @@ export interface ScanProgress {
   totalItems: number | null;
   currentPath: string | null;
   totalFilesSeen: number;
-  supportedFiles: number;
+  scannedFiles: number;
   hashCandidateFiles: number;
   previewGroups: DuplicateGroup[];
 }

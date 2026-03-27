@@ -10,12 +10,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::{DirEntry, WalkDir};
 
 const QUARANTINE_DIR_NAME: &str = ".picman-quarantine";
-const SUPPORTED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "heic"];
+const IMAGE_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "heic"];
 const MAX_WARNINGS: usize = 25;
 const MAX_PREVIEW_GROUPS: usize = 12;
 const SCAN_PROGRESS_EVENT: &str = "scan-progress";
@@ -68,7 +68,7 @@ struct DuplicateGroup {
 #[serde(rename_all = "camelCase")]
 struct ScanSummary {
     total_files_seen: usize,
-    supported_files: usize,
+    scanned_files: usize,
     duplicate_groups: usize,
     exact_groups: usize,
     reduced_groups: usize,
@@ -96,7 +96,7 @@ struct ScanProgressPayload {
     total_items: Option<usize>,
     current_path: Option<String>,
     total_files_seen: usize,
-    supported_files: usize,
+    scanned_files: usize,
     hash_candidate_files: usize,
     preview_groups: Vec<DuplicateGroup>,
 }
@@ -125,10 +125,11 @@ struct ScanCandidate {
 
 #[derive(Debug)]
 struct ScanInventory {
-    supported_candidates: Vec<ScanCandidate>,
+    image_candidates: Vec<ScanCandidate>,
     hash_candidates: Vec<ScanCandidate>,
     total_files_seen: usize,
-    supported_files: usize,
+    scanned_files: usize,
+    image_files: usize,
     skipped_files: usize,
     hash_candidate_files: usize,
 }
@@ -206,12 +207,13 @@ fn scan_photo_library_impl(
 
     let mut warnings = Vec::new();
     let inventory =
-        collect_supported_photo_paths(&roots, use_root_prefix, app, cancel_flag, &mut warnings)?;
+        collect_file_paths(&roots, use_root_prefix, app, cancel_flag, &mut warnings)?;
     let ScanInventory {
-        supported_candidates,
+        image_candidates,
         hash_candidates,
         total_files_seen,
-        supported_files,
+        scanned_files,
+        image_files,
         skipped_files,
         hash_candidate_files,
     } = inventory;
@@ -228,7 +230,7 @@ fn scan_photo_library_impl(
                 .collect(),
             summary: ScanSummary {
                 total_files_seen,
-                supported_files,
+                scanned_files,
                 duplicate_groups: 0,
                 exact_groups: 0,
                 reduced_groups: 0,
@@ -247,14 +249,14 @@ fn scan_photo_library_impl(
         ScanProgressPayload::new(
             "hashing",
             format!(
-                "{} photo(s) prises en charge, {} candidate(s) a hasher sur {} thread(s).",
-                supported_files, hash_candidate_files, hash_parallelism
+                "{} fichier(s) pris en charge, {} candidate(s) a hasher sur {} thread(s).",
+                scanned_files, hash_candidate_files, hash_parallelism
             ),
             0,
             Some(hash_candidate_files),
             None,
             total_files_seen,
-            supported_files,
+            scanned_files,
             hash_candidate_files,
             Vec::new(),
         ),
@@ -319,7 +321,7 @@ fn scan_photo_library_impl(
                         Some(hash_candidate_files),
                         Some(candidate.display_path.clone()),
                         total_files_seen,
-                        supported_files,
+                        scanned_files,
                         hash_candidate_files,
                         preview_groups,
                     ),
@@ -352,7 +354,7 @@ fn scan_photo_library_impl(
                     Some(hash_candidate_files),
                     None,
                     total_files_seen,
-                    supported_files,
+                    scanned_files,
                     hash_candidate_files,
                     preview_groups,
                 ),
@@ -374,14 +376,14 @@ fn scan_photo_library_impl(
         ScanProgressPayload::new(
             "similarity",
             format!(
-                "Verification des copies reduites ou recompressees sur {} photo(s).",
-                supported_files
+                "Verification des copies reduites ou recompressees sur {} image(s).",
+                image_files
             ),
             0,
-            Some(supported_files),
+            Some(image_files),
             None,
             total_files_seen,
-            supported_files,
+            scanned_files,
             hash_candidate_files,
             build_duplicate_groups_preview(&groups),
         ),
@@ -392,7 +394,7 @@ fn scan_photo_library_impl(
     let similar_records = Arc::new(Mutex::new(Vec::<SimilarPhotoRecord>::new()));
 
     let similarity_result = pool.install(|| {
-        supported_candidates
+        image_candidates
             .par_iter()
             .try_for_each(|candidate| -> Result<(), String> {
                 if is_scan_cancelled(cancel_flag) {
@@ -422,7 +424,7 @@ fn scan_photo_library_impl(
 
                 let processed_items = similarity_processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-                if should_emit_similarity_progress(processed_items, supported_files)
+                if should_emit_similarity_progress(processed_items, image_files)
                     && similarity_last_emitted.swap(processed_items, Ordering::SeqCst) < processed_items
                 {
                     emit_scan_progress(
@@ -430,13 +432,13 @@ fn scan_photo_library_impl(
                         ScanProgressPayload::new(
                             "similarity",
                             format!(
-                                "Comparaison visuelle {processed_items}/{supported_files}..."
+                                "Comparaison visuelle {processed_items}/{image_files}..."
                             ),
                             processed_items,
-                            Some(supported_files),
+                            Some(image_files),
                             Some(candidate.display_path.clone()),
                             total_files_seen,
-                            supported_files,
+                            scanned_files,
                             hash_candidate_files,
                             build_duplicate_groups_preview(&groups),
                         ),
@@ -459,10 +461,10 @@ fn scan_photo_library_impl(
                     "cancelled",
                     "Analyse annulee par l'utilisateur.",
                     similarity_processed_counter.load(Ordering::SeqCst),
-                    Some(supported_files),
+                    Some(image_files),
                     None,
                     total_files_seen,
-                    supported_files,
+                    scanned_files,
                     hash_candidate_files,
                     build_duplicate_groups_preview(&groups),
                 ),
@@ -502,11 +504,11 @@ fn scan_photo_library_impl(
             format!(
                 "Analyse terminee: {exact_groups} doublon(s) exact(s) et {reduced_group_count} copie(s) reduite(s) detecte(s)."
             ),
-            supported_files,
-            Some(supported_files),
+            scanned_files,
+            Some(scanned_files),
             None,
             total_files_seen,
-            supported_files,
+            scanned_files,
             hash_candidate_files,
             build_duplicate_groups_preview(&all_groups),
         ),
@@ -523,7 +525,7 @@ fn scan_photo_library_impl(
             .collect(),
         summary: ScanSummary {
             total_files_seen,
-            supported_files,
+            scanned_files,
             duplicate_groups: all_groups.len(),
             exact_groups,
             reduced_groups: reduced_group_count,
@@ -597,7 +599,7 @@ fn quarantine_duplicates_impl(
     })
 }
 
-fn collect_supported_photo_paths(
+fn collect_file_paths(
     roots: &[ScanRoot],
     use_root_prefix: bool,
     app: &AppHandle,
@@ -605,9 +607,10 @@ fn collect_supported_photo_paths(
     warnings: &mut Vec<String>,
 ) -> Result<ScanInventory, String> {
     let mut size_groups: HashMap<u64, Vec<ScanCandidate>> = HashMap::new();
-    let mut supported_candidates = Vec::new();
+    let mut image_candidates = Vec::new();
     let mut total_files_seen = 0usize;
-    let mut supported_files = 0usize;
+    let mut scanned_files = 0usize;
+    let mut image_files = 0usize;
     let mut skipped_files = 0usize;
 
     for (root_index, root) in roots.iter().enumerate() {
@@ -634,38 +637,37 @@ fn collect_supported_photo_paths(
 
             total_files_seen += 1;
 
-            if is_supported_image(entry.path()) {
-                match entry.metadata() {
-                    Ok(metadata) => {
-                        supported_files += 1;
-                        let candidate = ScanCandidate {
-                            path: entry.path().to_path_buf(),
-                            root_index,
-                            display_path: display_path_for_root(
-                                root,
-                                entry.path(),
-                                use_root_prefix,
-                            ),
-                        };
-                        supported_candidates.push(candidate.clone());
-                        size_groups
-                            .entry(metadata.len())
-                            .or_default()
-                            .push(candidate);
+            match entry.metadata() {
+                Ok(metadata) => {
+                    scanned_files += 1;
+                    let candidate = ScanCandidate {
+                        path: entry.path().to_path_buf(),
+                        root_index,
+                        display_path: display_path_for_root(
+                            root,
+                            entry.path(),
+                            use_root_prefix,
+                        ),
+                    };
+                    if is_image_file(entry.path()) {
+                        image_files += 1;
+                        image_candidates.push(candidate.clone());
                     }
-                    Err(error) => {
-                        skipped_files += 1;
-                        push_warning(
-                            warnings,
-                            format!(
-                                "{}: metadata indisponibles ({error})",
-                                entry.path().to_string_lossy()
-                            ),
-                        );
-                    }
+                    size_groups
+                        .entry(metadata.len())
+                        .or_default()
+                        .push(candidate);
                 }
-            } else {
-                skipped_files += 1;
+                Err(error) => {
+                    skipped_files += 1;
+                    push_warning(
+                        warnings,
+                        format!(
+                            "{}: metadata indisponibles ({error})",
+                            entry.path().to_string_lossy()
+                        ),
+                    );
+                }
             }
 
             if should_emit_count_progress(total_files_seen) {
@@ -674,14 +676,14 @@ fn collect_supported_photo_paths(
                     ScanProgressPayload::new(
                         "counting",
                         format!(
-                            "{} entree(s) parcourue(s), {} photo(s) retenue(s).",
-                            total_files_seen, supported_files
+                            "{} entree(s) parcourue(s), {} fichier(s) retenu(s).",
+                            total_files_seen, scanned_files
                         ),
                         total_files_seen,
                         None,
                         Some(display_path_for_root(root, entry.path(), use_root_prefix)),
                         total_files_seen,
-                        supported_files,
+                        scanned_files,
                         0,
                         Vec::new(),
                     ),
@@ -698,24 +700,25 @@ fn collect_supported_photo_paths(
         ScanProgressPayload::new(
             "counting",
             format!(
-                "Preparation terminee: {} photo(s) en file d'attente, {} candidate(s) a hasher.",
-                supported_files, hash_candidate_files
+                "Preparation terminee: {} fichier(s) en file d'attente, {} candidate(s) a hasher.",
+                scanned_files, hash_candidate_files
             ),
             total_files_seen,
             None,
             None,
             total_files_seen,
-            supported_files,
+            scanned_files,
             hash_candidate_files,
             Vec::new(),
         ),
     );
 
     Ok(ScanInventory {
-        supported_candidates,
+        image_candidates,
         hash_candidates,
         total_files_seen,
-        supported_files,
+        scanned_files,
+        image_files,
         skipped_files,
         hash_candidate_files,
     })
@@ -740,29 +743,10 @@ fn build_duplicate_groups(
 ) -> Vec<DuplicateGroup> {
     let mut groups: Vec<DuplicateGroup> = files_by_hash
         .iter()
-        .filter_map(|(hash, files)| {
-            if files.len() < 2 {
-                return None;
-            }
-
-            let mut files = files.clone();
-            files.sort_by(compare_keep_candidates);
-            let keep_file = files.first()?.clone();
-            let total_size_bytes = files.iter().map(|file| file.size_bytes).sum();
-            let reclaimable_bytes = files.iter().skip(1).map(|file| file.size_bytes).sum();
-            let keep_reason = explain_keep_choice(&keep_file, &files);
-
-            Some(DuplicateGroup {
-                hash: hash.clone(),
-                group_kind: "exact".to_string(),
-                file_count: files.len(),
-                total_size_bytes,
-                reclaimable_bytes,
-                keep_path: keep_file.path.clone(),
-                keep_relative_path: keep_file.relative_path.clone(),
-                keep_reason,
-                files,
-            })
+        .flat_map(|(hash, files)| {
+            build_exact_groups_for_hash(hash, files)
+                .into_iter()
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -852,6 +836,43 @@ fn build_duplicate_groups_preview(groups: &[DuplicateGroup]) -> Vec<DuplicateGro
     groups.iter().take(MAX_PREVIEW_GROUPS).cloned().collect()
 }
 
+fn build_exact_groups_for_hash(hash: &str, files: &[PhotoRecord]) -> Vec<DuplicateGroup> {
+    let mut files_by_extension: HashMap<&str, Vec<PhotoRecord>> = HashMap::new();
+    for file in files {
+        files_by_extension
+            .entry(file.extension.as_str())
+            .or_default()
+            .push(file.clone());
+    }
+
+    files_by_extension
+        .into_iter()
+        .filter_map(|(_, mut exact_files)| {
+            if exact_files.len() < 2 {
+                return None;
+            }
+
+            exact_files.sort_by(compare_keep_candidates);
+            let keep_file = exact_files.first()?.clone();
+            let total_size_bytes = exact_files.iter().map(|file| file.size_bytes).sum();
+            let reclaimable_bytes = exact_files.iter().skip(1).map(|file| file.size_bytes).sum();
+            let keep_reason = explain_keep_choice(&keep_file, &exact_files);
+
+            Some(DuplicateGroup {
+                hash: hash.to_string(),
+                group_kind: "exact".to_string(),
+                file_count: exact_files.len(),
+                total_size_bytes,
+                reclaimable_bytes,
+                keep_path: keep_file.path.clone(),
+                keep_relative_path: keep_file.relative_path.clone(),
+                keep_reason,
+                files: exact_files,
+            })
+        })
+        .collect()
+}
+
 fn should_visit_entry(entry: &DirEntry) -> bool {
     entry.depth() == 0 || entry.file_name() != QUARANTINE_DIR_NAME
 }
@@ -884,7 +905,7 @@ fn canonicalize_existing_roots(root_paths: Vec<String>) -> Result<Vec<ScanRoot>,
     }
 
     if roots.is_empty() {
-        return Err("Ajoute au moins un dossier photo a analyser.".into());
+        return Err("Ajoute au moins un dossier a analyser.".into());
     }
 
     Ok(roots)
@@ -919,12 +940,48 @@ fn find_matching_root_index(roots: &[ScanRoot], source_path: &Path) -> Result<us
         .ok_or_else(|| "Le fichier n'appartient a aucun des dossiers scannes.".to_string())
 }
 
-fn is_supported_image(path: &Path) -> bool {
+fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
-        .map(|extension| SUPPORTED_EXTENSIONS.contains(&extension.as_str()))
+        .map(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str()))
         .unwrap_or(false)
+}
+
+fn ensure_file_accessible_for_scan(path: &Path) -> Result<PathBuf, String> {
+    try_prepare_file_for_scan(path).map_err(|error| {
+        format!(
+            "fichier cloud non synchronise ou inaccessible apres tentative de synchronisation ({error})"
+        )
+    })?;
+
+    Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+fn try_prepare_file_for_scan(path: &Path) -> Result<(), String> {
+    let mut last_error = None;
+
+    for delay_ms in [0u64, 200, 500, 1_000] {
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+
+        match probe_file_for_scan(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "acces local impossible".to_string()))
+}
+
+fn probe_file_for_scan(path: &Path) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|error| format!("ouverture impossible ({error})"))?;
+    let mut probe = [0u8; 1];
+    file.read(&mut probe)
+        .map_err(|error| format!("lecture impossible ({error})"))?;
+    fs::metadata(path).map_err(|error| format!("metadata indisponibles ({error})"))?;
+    Ok(())
 }
 
 fn build_hashed_photo_record(
@@ -932,11 +989,9 @@ fn build_hashed_photo_record(
     path: &Path,
     use_root_prefix: bool,
 ) -> Result<(String, PhotoRecord), String> {
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|error| format!("chemin non resolu ({error})"))?;
-    let record = build_photo_record_metadata(root, &canonical_path, use_root_prefix)?;
-    let hash = compute_sha256(&canonical_path)?;
+    let accessible_path = ensure_file_accessible_for_scan(path)?;
+    let record = build_photo_record_metadata(root, &accessible_path, use_root_prefix)?;
+    let hash = compute_sha256(&accessible_path)?;
     Ok((hash, record))
 }
 
@@ -945,12 +1000,10 @@ fn build_similar_photo_record(
     path: &Path,
     use_root_prefix: bool,
 ) -> Result<Option<SimilarPhotoRecord>, String> {
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|error| format!("chemin non resolu ({error})"))?;
-    let record = build_photo_record_metadata(root, &canonical_path, use_root_prefix)?;
+    let accessible_path = ensure_file_accessible_for_scan(path)?;
+    let record = build_photo_record_metadata(root, &accessible_path, use_root_prefix)?;
     let Some((signature, aspect_ratio_key)) = compute_visual_signature(
-        &canonical_path,
+        &accessible_path,
         &record.extension,
         record.width,
         record.height,
@@ -968,27 +1021,27 @@ fn build_similar_photo_record(
 
 fn build_photo_record_metadata(
     root: &ScanRoot,
-    canonical_path: &Path,
+    path: &Path,
     use_root_prefix: bool,
 ) -> Result<PhotoRecord, String> {
-    let metadata = fs::metadata(&canonical_path)
+    let metadata = fs::metadata(path)
         .map_err(|error| format!("metadata indisponibles ({error})"))?;
-    let extension = canonical_path
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
         .ok_or_else(|| "extension manquante".to_string())?;
 
-    let dimensions = read_dimensions(&canonical_path, &extension);
+    let dimensions = read_dimensions(path, &extension);
     let size_bytes = metadata.len();
     let quality_score = compute_quality_score(&extension, dimensions, size_bytes);
     let quality_reason = build_quality_reason(&extension, dimensions, size_bytes);
-    let relative_path = display_path_for_root(root, &canonical_path, use_root_prefix);
+    let relative_path = display_path_for_root(root, path, use_root_prefix);
 
     Ok(PhotoRecord {
-        path: path_to_string(&canonical_path),
+        path: path_to_string(path),
         relative_path,
-        file_name: canonical_path
+        file_name: path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
@@ -1102,12 +1155,21 @@ fn build_quality_reason(
             extension.to_uppercase(),
             size_bytes
         ),
-        None => format!(
+        None if is_image_extension(extension) => format!(
             "dimensions non lues, format {}, {} octets",
             extension.to_uppercase(),
             size_bytes
         ),
+        None => format!(
+            "format {}, {} octets",
+            extension.to_uppercase(),
+            size_bytes
+        ),
     }
+}
+
+fn is_image_extension(extension: &str) -> bool {
+    IMAGE_EXTENSIONS.contains(&extension)
 }
 
 fn compare_keep_candidates(left: &PhotoRecord, right: &PhotoRecord) -> std::cmp::Ordering {
@@ -1340,7 +1402,7 @@ impl ScanProgressPayload {
         total_items: Option<usize>,
         current_path: Option<String>,
         total_files_seen: usize,
-        supported_files: usize,
+        scanned_files: usize,
         hash_candidate_files: usize,
         preview_groups: Vec<DuplicateGroup>,
     ) -> Self {
@@ -1351,7 +1413,7 @@ impl ScanProgressPayload {
             total_items,
             current_path,
             total_files_seen,
-            supported_files,
+            scanned_files,
             hash_candidate_files,
             preview_groups,
         }
@@ -1378,10 +1440,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_extensions_are_case_insensitive() {
-        assert!(is_supported_image(Path::new(r"C:\Photos\summer.JPG")));
-        assert!(is_supported_image(Path::new(r"C:\Photos\portrait.heic")));
-        assert!(!is_supported_image(Path::new(r"C:\Photos\clip.mp4")));
+    fn image_extensions_are_case_insensitive() {
+        assert!(is_image_file(Path::new(r"C:\Photos\summer.JPG")));
+        assert!(is_image_file(Path::new(r"C:\Photos\portrait.heic")));
+        assert!(!is_image_file(Path::new(r"C:\Photos\clip.mp4")));
     }
 
     #[test]
@@ -1469,6 +1531,59 @@ mod tests {
             .collect();
 
         assert_eq!(paths, vec!["b.jpg".to_string(), "c.jpg".to_string()]);
+    }
+
+    #[test]
+    fn exact_duplicate_groups_require_same_extension() {
+        let mut files_by_hash = HashMap::new();
+        files_by_hash.insert(
+            "same-hash".to_string(),
+            vec![
+                PhotoRecord {
+                    path: r"C:\Files\a.jpg".into(),
+                    relative_path: "a.jpg".into(),
+                    file_name: "a.jpg".into(),
+                    extension: "jpg".into(),
+                    size_bytes: 100,
+                    width: None,
+                    height: None,
+                    modified_unix_ms: None,
+                    quality_score: 100,
+                    quality_reason: String::new(),
+                },
+                PhotoRecord {
+                    path: r"C:\Files\b.jpg".into(),
+                    relative_path: "b.jpg".into(),
+                    file_name: "b.jpg".into(),
+                    extension: "jpg".into(),
+                    size_bytes: 100,
+                    width: None,
+                    height: None,
+                    modified_unix_ms: None,
+                    quality_score: 90,
+                    quality_reason: String::new(),
+                },
+                PhotoRecord {
+                    path: r"C:\Files\c.png".into(),
+                    relative_path: "c.png".into(),
+                    file_name: "c.png".into(),
+                    extension: "png".into(),
+                    size_bytes: 100,
+                    width: None,
+                    height: None,
+                    modified_unix_ms: None,
+                    quality_score: 95,
+                    quality_reason: String::new(),
+                },
+            ],
+        );
+
+        let groups = build_duplicate_groups(&files_by_hash, None);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hash, "same-hash");
+        assert_eq!(groups[0].file_count, 2);
+        assert!(groups[0].files.iter().all(|file| file.extension == "jpg"));
     }
 
     #[test]
